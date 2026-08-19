@@ -3,7 +3,7 @@
 A Streamlit rebuild of the Kaizen Suggestion Log, with role-based access:
 
 - **Staff / GEMBA workers** only ever see **Log Suggestion** and **My Suggestions** — no dashboard, no approval controls.
-- **Approvers** sign in with a password (Roshan / Akthar / Mafas seeded by default) and get **Dashboard**, **Approvals**, **All Suggestions**, and **Manage Approvers**.
+- **Approvers** sign in with a password and get **Dashboard**, **Approvals**, **All Suggestions**, and **Manage Approvers**.
 - A QR code on the login screen links straight to the staff submission form for phone use.
 - Optional Groq AI assist suggests a PQCDSM category + short quality note when a suggestion is submitted.
 - Optional SharePoint sync mirrors every new suggestion to a SharePoint list.
