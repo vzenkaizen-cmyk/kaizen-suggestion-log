@@ -696,27 +696,37 @@ def qr_expander():
 # Public (anonymous) pages — Staff / GEMBA
 # --------------------------------------------------------------------------- #
 def staff_access():
-    """Collect the name of the person who suggested the idea and its HOF/plant location."""
-    st.subheader("👤 Suggestion Entry")
+    """Collect GEMBA/staff identity and the HOF/plant site."""
+    st.subheader("👤 GEMBA / Staff Access")
     st.caption(
-        "Enter the name of the person who suggested the idea. The person entering the suggestion "
-        "may be someone else, which is useful when suggestions are collected at plant sites."
+        "Enter the name of the person who suggested the idea and select the plant/site. "
+        "You can also add a new plant if it is not in the list."
     )
- 
+
+    plant_options = DEPARTMENTS + ["➕ Add New Plant"]
+    current_site = st.session_state.get("staff_department")
+    default_index = plant_options.index(current_site) if current_site in plant_options else 0
+
     with st.form("staff_access_form", clear_on_submit=False):
         name = st.text_input(
             "Suggested by *",
             placeholder="Enter the name of the person who suggested the idea",
             value=st.session_state.get("staff_name") or "",
         )
-        department = st.selectbox(
+        selected_site = st.selectbox(
             "HOF / Plant Site *",
-            DEPARTMENTS,
-            index=(
-                DEPARTMENTS.index(st.session_state["staff_department"])
-                if st.session_state.get("staff_department") in DEPARTMENTS else 0
-            ),
+            plant_options,
+            index=default_index,
         )
+
+        new_plant = ""
+        if selected_site == "➕ Add New Plant":
+            new_plant = st.text_input(
+                "New Plant / Site Name *",
+                placeholder="e.g. ABC Hydro Power Plant",
+                help="Type the plant/site name exactly as you want it to appear in the system.",
+            )
+
         employee_type = st.radio(
             "Employee type *",
             ["GEMBA Worker", "Staff"],
@@ -728,22 +738,80 @@ def staff_access():
             type="primary",
             use_container_width=True,
         )
- 
+
     if continue_clicked:
         name = name.strip()
+        department = (new_plant if selected_site == "➕ Add New Plant" else selected_site).strip()
+
         if not name:
             st.error("Please enter the name of the person who suggested the idea.")
             return False
- 
-        with st.spinner("Processing staff access..."):
+        if not department:
+            st.error("Please enter a plant/site name.")
+            return False
+
+        with st.spinner("Processing GEMBA access..."):
             st.session_state["role"] = "staff"
             st.session_state["staff_name"] = name
             st.session_state["staff_department"] = department
             st.session_state["staff_employee_type"] = employee_type
             st.session_state["staff_access_granted"] = True
         st.rerun()
- 
+
     return False
+
+
+def page_site_implemented():
+    """Show implemented Kaizen suggestions for the currently selected plant/site only."""
+    site = (st.session_state.get("staff_department") or "").strip()
+    st.subheader(f"🟢 Implemented Suggestions — {site}")
+    st.caption(
+        "See Kaizen suggestions that have been implemented at your plant/site. "
+        "This view is limited to your selected site."
+    )
+
+    if not site:
+        st.warning("Please select your plant/site first.")
+        return
+
+    df = df_suggestions()
+    if df.empty:
+        st.info("No implemented suggestions are available yet.")
+        return
+
+    site_series = df["department"].fillna("").astype(str).str.strip()
+    view = df[
+        (df["status"].fillna("").astype(str).str.strip().str.lower() == "implemented")
+        & (site_series.str.casefold() == site.casefold())
+    ].copy()
+
+    if view.empty:
+        st.info(f"No implemented suggestions have been recorded for **{site}** yet.")
+        return
+
+    st.metric("Implemented suggestions at this site", len(view))
+    st.divider()
+
+    for _, r in view.sort_values(
+        ["date_implemented", "date_submitted"], ascending=False, na_position="last"
+    ).iterrows():
+        title = r["title"] or "Untitled suggestion"
+        with st.expander(f"💡 {title}"):
+            st.markdown("**Description**")
+            st.write(r["description"] or "No description provided.")
+            c1, c2, c3 = st.columns(3)
+            c1.caption(f"👤 Suggested by: {r['submitted_by'] or 'Not specified'}")
+            c2.caption(f"📅 Submitted: {r['date_submitted'] or '—'}")
+            c3.caption(f"✅ Implemented: {r['date_implemented'] or '—'}")
+
+            c4, c5, c6 = st.columns(3)
+            c4.caption(f"🏷️ Category: {r['category'] or '—'}")
+            c5.caption(f"🛠️ Technique: {r['technique_used'] or '—'}")
+            c6.caption(f"💰 Tangible value: Rs {float(r['tangible_value'] or 0):,.0f}")
+
+            if r["reward"]:
+                st.info(f"🏆 Recognition / Reward: {r['reward']}")
+
  
  
 def page_log_suggestion():
@@ -755,8 +823,8 @@ def page_log_suggestion():
     staff_employee_type = st.session_state.get("staff_employee_type")
  
     if not staff_name or not staff_department or not staff_employee_type:
-        st.warning("Please complete Staff / GEMBA Access before logging a suggestion.")
-        if st.button("Go to Staff / GEMBA Access", type="primary"):
+        st.warning("Please complete GEMBA / Staff Access before logging a suggestion.")
+        if st.button("Go to GEMBA / Staff Access", type="primary"):
             st.session_state["role"] = None
             st.rerun()
         return
@@ -1095,9 +1163,13 @@ def page_all_suggestions():
     f1, f2, f3, f4 = st.columns(4)
     status_filter = f1.multiselect("Status", STATUSES, default=STATUSES, key="all_status_filter")
 
-    department_options = DEPARTMENTS.copy()
-    if (df["department"].fillna("").astype(str).str.strip() == "Not specified").any():
-        department_options.append("Not specified")
+    # Include both the predefined plants and any plants added by GEMBA users.
+    database_sites = [
+        str(x).strip()
+        for x in df["department"].dropna().tolist()
+        if str(x).strip()
+    ]
+    department_options = list(dict.fromkeys(DEPARTMENTS + database_sites))
     dept_filter = f2.multiselect("HOF / Plant Site", department_options, key="all_department_filter")
 
     type_filter = f3.multiselect("Employee type", ["GEMBA Worker", "Staff"], key="all_type_filter")
@@ -1262,14 +1334,14 @@ def public_shell():
         staff_shell()
         return
  
-    header("KAIZEN", "Staff / GEMBA suggestion entry")
+    header("KAIZEN", "GEMBA worker suggestion entry")
     qr_expander()
  
     with st.sidebar:
         st.markdown("### Access")
         page = st.radio(
             "Choose access",
-            ["Staff / GEMBA Access", "Approver Sign In"],
+            ["GEMBA / Staff Access", "Approver Sign In"],
             label_visibility="collapsed",
         )
         st.divider()
@@ -1278,7 +1350,7 @@ def public_shell():
             "to support continuous improvement."
         )
  
-    if page == "Staff / GEMBA Access":
+    if page == "GEMBA / Staff Access":
         staff_access()
     else:
         approver_signin()
@@ -1288,19 +1360,33 @@ def staff_shell():
     name = st.session_state.get("staff_name", "Staff / GEMBA")
     department = st.session_state.get("staff_department", "")
     employee_type = st.session_state.get("staff_employee_type", "")
- 
-    header("STAFF / GEMBA", f"{name} · {department}")
- 
+
+    header("GEMBA WORKER", f"{name} · {department}")
+
     with st.sidebar:
-        st.markdown(f"### {name}")
+        st.markdown(f"### 👷 {name}")
         st.caption(f"{employee_type} · {department}")
         if st.button("Change staff / Log out", use_container_width=True):
             logout()
             st.rerun()
         st.divider()
-        st.info("Your suggestions are collected here. Thank you for contributing ideas for improvement.")
- 
-    page_log_suggestion()
+        st.markdown("### GEMBA Workspace")
+        page = st.radio(
+            "Navigation",
+            ["💡 New Suggestion", "🟢 Implemented at My Site"],
+            label_visibility="collapsed",
+        )
+        st.divider()
+        st.info(
+            "You can submit Kaizen ideas and view implemented improvements "
+            "recorded for your selected plant/site."
+        )
+
+    if page == "💡 New Suggestion":
+        page_log_suggestion()
+    else:
+        page_site_implemented()
+
  
  
 def approver_shell():
