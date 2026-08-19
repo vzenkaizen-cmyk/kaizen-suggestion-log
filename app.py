@@ -749,6 +749,9 @@ def staff_access():
         if not department:
             st.error("Please enter a plant/site name.")
             return False
+        if len(department) > 100:
+            st.error("Plant/site name must be 100 characters or fewer.")
+            return False
 
         with st.spinner("Processing GEMBA access..."):
             st.session_state["role"] = "staff"
@@ -1050,58 +1053,117 @@ def kpi_card(label, value, col):
  
 def page_dashboard():
     st.subheader("📊 Approver Dashboard")
-    st.caption("A management view of all suggestions stored in the connected database.")
+    st.caption("Management view of suggestions with plant/site-level performance.")
+
     df = df_suggestions()
     if df.empty:
         st.info("No suggestions logged yet. New Staff/GEMBA submissions will appear here automatically.")
         return
- 
-    total = len(df)
-    pending = int((df["status"] == "Pending").sum())
-    approved = int((df["status"] == "Approved").sum())
-    rejected = int((df["status"] == "Rejected").sum())
-    implemented = int((df["status"] == "Implemented").sum())
+
+    # Include predefined plants plus any new plant/site entered by GEMBA users.
+    database_sites = [str(x).strip() for x in df["department"].dropna().tolist() if str(x).strip()]
+    department_options = list(dict.fromkeys(DEPARTMENTS + database_sites))
+
+    # Dashboard-only plant selector.
+    selected_site = st.selectbox(
+        "🏭 Select Plant / Site",
+        ["All Plants / Sites"] + department_options,
+        key="dashboard_site_filter",
+    )
+
+    if selected_site == "All Plants / Sites":
+        site_df = df.copy()
+    else:
+        site_df = df[df["department"].fillna("Not specified").astype(str).str.strip() == selected_site].copy()
+
+    # KPIs for selected plant/site.
+    total = len(site_df)
+    pending = int((site_df["status"] == "Pending").sum())
+    approved = int((site_df["status"] == "Approved").sum())
+    rejected = int((site_df["status"] == "Rejected").sum())
+    implemented = int((site_df["status"] == "Implemented").sum())
+    approved_total = approved + implemented
     impl_rate = round(100 * implemented / total, 0) if total else 0
-    tangible_total = df["tangible_value"].fillna(0).astype(float).sum()
- 
+    tangible_total = site_df["tangible_value"].fillna(0).astype(float).sum()
+
+    st.markdown(f"### 📍 {selected_site}")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total suggestions", total)
     c2.metric("Pending review", pending)
-    c3.metric("Approved / Implemented", approved + implemented)
+    c3.metric("Approved", approved)
     c4.metric("Rejected", rejected)
+
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Implementation rate", f"{impl_rate:.0f}%")
-    c6.metric("GEMBA suggestions", int((df["employee_type"] == "GEMBA Worker").sum()))
-    c7.metric("Staff suggestions", int((df["employee_type"] == "Staff").sum()))
+    c5.metric("Implemented", implemented)
+    c6.metric("Approved + Implemented", approved_total)
+    c7.metric("Implementation rate", f"{impl_rate:.0f}%")
     c8.metric("Tangible value", f"Rs {tangible_total:,.0f}")
- 
+
     st.divider()
+
+    # Site-by-site summary is visible when All Plants / Sites is selected.
+    summary_rows = []
+    for site in department_options:
+        sdf = df[df["department"].fillna("Not specified").astype(str).str.strip() == site]
+        if sdf.empty:
+            continue
+        approved_site = int((sdf["status"] == "Approved").sum())
+        implemented_site = int((sdf["status"] == "Implemented").sum())
+        rejected_site = int((sdf["status"] == "Rejected").sum())
+        pending_site = int((sdf["status"] == "Pending").sum())
+        summary_rows.append({
+            "Plant / Site": site,
+            "Total Suggestions": len(sdf),
+            "Pending": pending_site,
+            "Approved": approved_site,
+            "Implemented": implemented_site,
+            "Approved + Implemented": approved_site + implemented_site,
+            "Rejected": rejected_site,
+        })
+
+    if selected_site == "All Plants / Sites":
+        st.markdown("### 🏭 Site-wise Suggestion Summary")
+        st.caption("Choose a plant above to focus the dashboard on that site.")
+        if summary_rows:
+            summary_df = pd.DataFrame(summary_rows).sort_values("Total Suggestions", ascending=False)
+            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No plant/site information is available yet.")
+
     left, right = st.columns(2)
     with left:
         st.markdown("**Suggestion status**")
-        status_df = df["status"].value_counts().reindex(STATUSES, fill_value=0).reset_index()
+        status_df = site_df["status"].value_counts().reindex(STATUSES, fill_value=0).reset_index()
         status_df.columns = ["Status", "Count"]
         fig = px.bar(status_df, x="Count", y="Status", orientation="h", text="Count")
         fig.update_layout(showlegend=False, height=320, margin=dict(l=10,r=10,t=10,b=10), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig, use_container_width=True)
+
     with right:
-        st.markdown("**GEMBA vs Staff — suggestions**")
-        type_df = df["employee_type"].fillna("Unknown").value_counts().reset_index()
-        type_df.columns = ["Employee Type", "Count"]
-        fig2 = px.bar(type_df, x="Count", y="Employee Type", orientation="h", text="Count")
-        fig2.update_layout(showlegend=False, height=320, margin=dict(l=10,r=10,t=10,b=10), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
-        st.plotly_chart(fig2, use_container_width=True)
- 
+        if selected_site == "All Plants / Sites" and summary_rows:
+            st.markdown("**Plant-wise status comparison**")
+            chart_df = pd.DataFrame(summary_rows).set_index("Plant / Site")[["Pending", "Approved", "Implemented", "Rejected"]]
+            fig2 = px.bar(chart_df, barmode="group", text_auto=True)
+            fig2.update_layout(height=320, margin=dict(l=10,r=10,t=10,b=10), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", legend_title_text="Status")
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.markdown(f"**{selected_site} — Employee Type**")
+            type_df = site_df["employee_type"].fillna("Unknown").value_counts().reset_index()
+            type_df.columns = ["Employee Type", "Count"]
+            fig2 = px.bar(type_df, x="Count", y="Employee Type", orientation="h", text="Count")
+            fig2.update_layout(showlegend=False, height=320, margin=dict(l=10,r=10,t=10,b=10), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig2, use_container_width=True)
+
     st.divider()
     st.markdown("**Recent activity**")
-    recent = df[["id","date_submitted","submitted_by","department","title","status","approver","approval_date"]].head(10).copy()
-    recent.columns = ["ID","Submitted","Submitted By","Department","Suggestion","Status","Decided By","Decision Date"]
-    st.dataframe(recent, use_container_width=True, hide_index=True)
- 
- 
-# --------------------------------------------------------------------------- #
-# Approver — Approvals queue
-# --------------------------------------------------------------------------- #
+    if site_df.empty:
+        st.info("No suggestions for this plant/site.")
+    else:
+        recent = site_df[["id","date_submitted","submitted_by","department","title","status","approver","approval_date"]].head(10).copy()
+        recent.columns = ["ID","Submitted","Submitted By","Department","Suggestion","Status","Decided By","Decision Date"]
+        st.dataframe(recent, use_container_width=True, hide_index=True)
+
+
 def page_approvals():
     st.subheader("Approvals")
     df = df_suggestions()
