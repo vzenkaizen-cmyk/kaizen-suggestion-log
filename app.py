@@ -486,6 +486,11 @@ def import_legacy_excel(uploaded_file):
 def insert_suggestion(row: dict) -> int:
     engine = get_engine()
     is_postgres = engine.dialect.name == "postgresql"
+
+    # legacy_no stores the original Excel "No." value.
+    # New web submissions have no Excel number, so explicitly pass NULL.
+    row = dict(row)
+    row.setdefault("legacy_no", None)
  
     sql = """INSERT INTO suggestions
              (legacy_no, submitted_by, employee_type, department, date_submitted, title, description,
@@ -879,6 +884,8 @@ def page_log_suggestion():
             final_category = category if category else ([ai_category] if ai_category else [])
  
             row = {
+                # New web submissions are not from the legacy Excel workbook.
+                "legacy_no": None,
                 "submitted_by": staff_name,
                 "employee_type": staff_employee_type,
                 "department": staff_department,
