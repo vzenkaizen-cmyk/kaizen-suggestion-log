@@ -484,13 +484,13 @@ def import_legacy_excel(uploaded_file):
 
  
 def insert_suggestion(row: dict) -> int:
-    engine = get_engine()
-    is_postgres = engine.dialect.name == "postgresql"
-
-    # legacy_no stores the original Excel "No." value.
-    # New web submissions have no Excel number, so explicitly pass NULL.
+    # New web-submitted suggestions do not use the legacy Excel number.
+    # Keep the field nullable so both imported and new records work.
     row = dict(row)
     row.setdefault("legacy_no", None)
+
+    engine = get_engine()
+    is_postgres = engine.dialect.name == "postgresql"
  
     sql = """INSERT INTO suggestions
              (legacy_no, submitted_by, employee_type, department, date_submitted, title, description,
@@ -768,12 +768,12 @@ def staff_access():
 
 
 def page_site_implemented():
-    """Show implemented Kaizen suggestions for the currently selected plant/site only."""
+    """Show all Kaizen suggestions recorded for the currently selected plant/site."""
     site = (st.session_state.get("staff_department") or "").strip()
-    st.subheader(f"🟢 Implemented Suggestions — {site}")
+    st.subheader(f"📋 Suggestions at My Site — {site}")
     st.caption(
-        "See Kaizen suggestions that have been implemented at your plant/site. "
-        "This view is limited to your selected site."
+        "See all Kaizen suggestions recorded for your selected plant/site, "
+        "including Pending, Approved, Rejected and Implemented suggestions."
     )
 
     if not site:
@@ -782,38 +782,79 @@ def page_site_implemented():
 
     df = df_suggestions()
     if df.empty:
-        st.info("No implemented suggestions are available yet.")
+        st.info(f"No suggestions have been recorded for **{site}** yet.")
         return
 
+    # Filter ONLY by the staff member's selected plant/site.
+    # Do not filter by status, so Pending suggestions are visible immediately
+    # after submission.
     site_series = df["department"].fillna("").astype(str).str.strip()
-    view = df[
-        (df["status"].fillna("").astype(str).str.strip().str.lower() == "implemented")
-        & (site_series.str.casefold() == site.casefold())
-    ].copy()
+    view = df[site_series.str.casefold() == site.casefold()].copy()
 
     if view.empty:
-        st.info(f"No implemented suggestions have been recorded for **{site}** yet.")
+        st.info(f"No suggestions have been recorded for **{site}** yet.")
         return
 
-    st.metric("Implemented suggestions at this site", len(view))
+    # Normalize status for display and calculate site-level counts.
+    view["display_status"] = (
+        view["status"].fillna("Pending").astype(str).str.strip().str.title()
+    )
+
+    total = len(view)
+    pending = int((view["display_status"] == "Pending").sum())
+    approved = int((view["display_status"] == "Approved").sum())
+    rejected = int((view["display_status"] == "Rejected").sum())
+    implemented = int((view["display_status"] == "Implemented").sum())
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total", total)
+    c2.metric("Pending", pending)
+    c3.metric("Approved", approved)
+    c4.metric("Rejected", rejected)
+    c5.metric("Implemented", implemented)
+
     st.divider()
 
-    for _, r in view.sort_values(
-        ["date_implemented", "date_submitted"], ascending=False, na_position="last"
-    ).iterrows():
+    # Show newest suggestions first.
+    view = view.sort_values(
+        ["date_submitted", "id"], ascending=False, na_position="last"
+    )
+
+    for _, r in view.iterrows():
         title = r["title"] or "Untitled suggestion"
-        with st.expander(f"💡 {title}"):
+        status = r["display_status"]
+
+        status_icon = {
+            "Pending": "🟠",
+            "Approved": "🟢",
+            "Rejected": "🔴",
+            "Implemented": "🔵",
+        }.get(status, "⚪")
+
+        with st.expander(f"💡 {title} — {status_icon} {status}"):
             st.markdown("**Description**")
             st.write(r["description"] or "No description provided.")
+
             c1, c2, c3 = st.columns(3)
             c1.caption(f"👤 Suggested by: {r['submitted_by'] or 'Not specified'}")
             c2.caption(f"📅 Submitted: {r['date_submitted'] or '—'}")
-            c3.caption(f"✅ Implemented: {r['date_implemented'] or '—'}")
+            c3.caption(f"📌 Status: {status}")
 
             c4, c5, c6 = st.columns(3)
             c4.caption(f"🏷️ Category: {r['category'] or '—'}")
             c5.caption(f"🛠️ Technique: {r['technique_used'] or '—'}")
             c6.caption(f"💰 Tangible value: Rs {float(r['tangible_value'] or 0):,.0f}")
+
+            if r["approver"]:
+                st.caption(f"👤 Reviewed by: {r['approver']}")
+
+            if r["approval_date"]:
+                st.caption(f"📅 Decision date: {r['approval_date']}")
+
+            if status == "Implemented":
+                st.success(
+                    f"✅ Implemented on: {r['date_implemented'] or 'Date not recorded'}"
+                )
 
             if r["reward"]:
                 st.info(f"🏆 Recognition / Reward: {r['reward']}")
@@ -884,7 +925,6 @@ def page_log_suggestion():
             final_category = category if category else ([ai_category] if ai_category else [])
  
             row = {
-                # New web submissions are not from the legacy Excel workbook.
                 "legacy_no": None,
                 "submitted_by": staff_name,
                 "employee_type": staff_employee_type,
@@ -1440,13 +1480,13 @@ def staff_shell():
         st.markdown("### GEMBA Workspace")
         page = st.radio(
             "Navigation",
-            ["💡 New Suggestion", "🟢 Implemented at My Site"],
+            ["💡 New Suggestion", "📋 Suggestions at My Site"],
             label_visibility="collapsed",
         )
         st.divider()
         st.info(
-            "You can submit Kaizen ideas and view implemented improvements "
-            "recorded for your selected plant/site."
+            "You can submit Kaizen ideas and view all suggestions and their "
+            "current status for your selected plant/site."
         )
 
     if page == "💡 New Suggestion":
