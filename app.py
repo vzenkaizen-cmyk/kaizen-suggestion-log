@@ -678,18 +678,16 @@ def header(badge: str, who: str):
  
  
 def qr_expander():
-    with st.expander("📱 Get a QR code to log a suggestion from your phone", expanded=False):
-        default_url = st.secrets.get("APP_URL", "")
-        app_url = st.text_input(
-            "App URL (paste your deployed Streamlit URL once, then it's remembered for this session)",
-            value=default_url,
-            placeholder="https://your-app.streamlit.app",
-            key="app_url_input",
+    with st.expander("📱 Scan QR code to log a suggestion from your phone", expanded=True):
+        app_url = "https://kaizen-suggestion-log.streamlit.app"
+
+        st.image(
+            qr_png_bytes(app_url),
+            caption="Scan this QR code to open Kaizen Suggestions",
+            width=220,
         )
-        if app_url:
-            st.image(qr_png_bytes(app_url), caption="Scan to log a suggestion", width=220)
-        else:
-            st.info("Enter your app's public URL above (or set APP_URL in secrets) to generate the QR code.")
+
+        st.caption("Scan the QR code with your phone to log a suggestion.")
  
  
 # --------------------------------------------------------------------------- #
