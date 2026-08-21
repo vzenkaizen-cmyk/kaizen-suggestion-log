@@ -44,6 +44,7 @@ APP_URL                            -> used to build the QR code for phone submis
  
 import hashlib
 import io
+import re
 from datetime import date, datetime
  
 import pandas as pd
@@ -347,11 +348,152 @@ def _normalize_employee_type(value):
     if "staff" in low: return "Staff"
     return value
 
+def _normalise_excel_header(value) -> str:
+    """Return a stable version of an Excel column heading for matching."""
+    if value is None or pd.isna(value):
+        return ""
+    value = str(value).replace("\ufeff", " ").strip().lower()
+    value = re.sub(r"[\r\n\t]+", " ", value)
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+# Common historical/workbook header variations accepted by the importer.
+EXCEL_COLUMN_ALIASES = {
+    "No": [
+        "no", "no.", "number", "s no", "s.no", "s no.", "serial no",
+        "serial number", "kaizen no", "kaizen number"
+    ],
+    "Name": [
+        "name", "employee name", "submitted by", "suggested by",
+        "suggested by name", "employee"
+    ],
+    "Role": [
+        "role", "employee role", "employee type", "staff type",
+        "worker type", "designation"
+    ],
+    "Date Submitted": [
+        "date submitted", "submitted date", "submission date",
+        "date of submission", "date"
+    ],
+    "Title": [
+        "title", "suggestion title", "kaizen title", "suggestion",
+        "kaizen suggestion", "idea title"
+    ],
+    "Department": [
+        "department", "dept", "hof plant site", "hof plant",
+        "hof site", "plant site", "plant", "site", "location",
+        "hof plant site name"
+    ],
+    "Description": [
+        "description", "suggestion description", "idea description",
+        "details", "suggestion details", "kaizen description"
+    ],
+    "Categories (PQCDSM)": [
+        "categories pqcdsm", "category", "categories", "pqcdsm",
+        "category pqcdsm", "categories pqcdsm"
+    ],
+    "Technique Used": [
+        "technique used", "technique", "kaizen technique"
+    ],
+    "Status": [
+        "status", "suggestion status"
+    ],
+    "Decided By": [
+        "decided by", "decision by", "approver", "approved by",
+        "reviewed by"
+    ],
+    "Decision Date": [
+        "decision date", "date decided", "approval date",
+        "approved date"
+    ],
+    "Date Implemented": [
+        "date implemented", "implemented date", "implementation date"
+    ],
+    "Tangible Value (LKR/yr)": [
+        "tangible value lkr yr", "tangible value lkr year",
+        "tangible value", "annual tangible value", "value lkr yr",
+        "savings lkr yr", "saving lkr yr"
+    ],
+    "Reward Given": [
+        "reward given", "reward", "recognition", "reward recognition"
+    ],
+    "Reward Value (LKR)": [
+        "reward value lkr", "reward value", "reward amount",
+        "reward amount lkr"
+    ],
+}
+
+
+def _find_excel_header_row(raw_preview: pd.DataFrame) -> int:
+    """Find the row containing the real column headings.
+
+    Some historical workbooks contain a report title, blank rows, or other
+    text above the actual table header. This searches the first 20 rows
+    instead of assuming row 1 is always the header.
+    """
+    alias_to_target = {}
+    for target, aliases in EXCEL_COLUMN_ALIASES.items():
+        for alias in [target] + aliases:
+            alias_to_target[_normalise_excel_header(alias)] = target
+
+    best_row = 0
+    best_score = 0
+
+    max_rows = min(len(raw_preview), 20)
+    for row_idx in range(max_rows):
+        score = 0
+        seen_targets = set()
+        for value in raw_preview.iloc[row_idx].tolist():
+            target = alias_to_target.get(_normalise_excel_header(value))
+            if target and target not in seen_targets:
+                score += 1
+                seen_targets.add(target)
+
+        if score > best_score:
+            best_score = score
+            best_row = row_idx
+
+    # A valid Kaizen table should contain at least the four core fields.
+    if best_score < 3:
+        return 0
+    return best_row
+
+
+def _normalise_kaizen_excel_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Map common historical Excel column names to the app's standard names."""
+    df = df.copy()
+
+    alias_to_target = {}
+    for target, aliases in EXCEL_COLUMN_ALIASES.items():
+        for alias in [target] + aliases:
+            alias_to_target[_normalise_excel_header(alias)] = target
+
+    rename_map = {}
+    used_targets = set()
+
+    for original_col in df.columns:
+        normalised = _normalise_excel_header(original_col)
+        target = alias_to_target.get(normalised)
+
+        if target and target not in used_targets:
+            rename_map[original_col] = target
+            used_targets.add(target)
+
+    df = df.rename(columns=rename_map)
+
+    # Remove completely empty columns created by Excel formatting.
+    df = df.dropna(axis=1, how="all")
+
+    return df
+
+
 def _read_uploaded_excel(uploaded_file) -> pd.DataFrame:
-    """Read an uploaded XLSX workbook reliably from bytes."""
+    """Read and normalise an uploaded XLSX workbook reliably."""
     data = uploaded_file.getvalue()
     if not data:
         raise ValueError("The uploaded Excel file is empty.")
+
     try:
         xls = pd.ExcelFile(io.BytesIO(data), engine="openpyxl")
     except ImportError as exc:
@@ -360,33 +502,82 @@ def _read_uploaded_excel(uploaded_file) -> pd.DataFrame:
         ) from exc
     except Exception as exc:
         raise ValueError(f"The workbook could not be opened: {exc}") from exc
-    sheet = "Kaizen Suggestions" if "Kaizen Suggestions" in xls.sheet_names else xls.sheet_names[0]
-    return pd.read_excel(io.BytesIO(data), sheet_name=sheet, engine="openpyxl")
+
+    if not xls.sheet_names:
+        raise ValueError("The workbook does not contain any worksheets.")
+
+    sheet = (
+        "Kaizen Suggestions"
+        if "Kaizen Suggestions" in xls.sheet_names
+        else xls.sheet_names[0]
+    )
+
+    # First read without assuming where the header is.
+    raw_preview = pd.read_excel(
+        io.BytesIO(data),
+        sheet_name=sheet,
+        header=None,
+        engine="openpyxl",
+    )
+
+    if raw_preview.empty:
+        raise ValueError(f"The '{sheet}' worksheet is empty.")
+
+    header_row = _find_excel_header_row(raw_preview)
+
+    # Re-read using the detected header row.
+    df = pd.read_excel(
+        io.BytesIO(data),
+        sheet_name=sheet,
+        header=header_row,
+        engine="openpyxl",
+    )
+
+    df = _normalise_kaizen_excel_columns(df)
+
+    # Remove rows that are completely empty.
+    df = df.dropna(how="all").reset_index(drop=True)
+
+    # The four core fields are required. Excel No is optional.
+    required = ["Name", "Role", "Date Submitted", "Title"]
+    missing = [c for c in required if c not in df.columns]
+
+    if missing:
+        detected = ", ".join(str(c) for c in df.columns if str(c).strip())
+        raise ValueError(
+            "The workbook could not be mapped to the required Kaizen fields. "
+            f"Missing: {', '.join(missing)}. "
+            f"Detected columns: {detected or 'None'}"
+        )
+
+    # These fields are optional in older workbooks.
+    optional_columns = [
+        "No", "Department", "Description", "Categories (PQCDSM)",
+        "Technique Used", "Status", "Decided By", "Decision Date",
+        "Date Implemented", "Tangible Value (LKR/yr)", "Reward Given",
+        "Reward Value (LKR)",
+    ]
+    for col in optional_columns:
+        if col not in df.columns:
+            df[col] = None
+
+    return df
+
 
 def import_legacy_excel(uploaded_file):
     """Import every individual suggestion row from the legacy workbook.
 
-    The workbook's 16 suggestion columns are mapped into the database. The
-    Summary sheet is intentionally not imported because the dashboard should
-    calculate totals from the individual suggestion records.
-    Repeated imports are safe: duplicate rows are skipped.
+    The importer accepts common historical column-name variations, detects
+    header rows that are not on the first Excel row, maps them to the app's
+    standard fields, and safely skips duplicates.
     """
     raw = _read_uploaded_excel(uploaded_file).copy()
 
-    required = ["No", "Name", "Role", "Date Submitted", "Title"]
+    # No/Excel number is optional. If the workbook has it, it is preserved.
+    required = ["Name", "Role", "Date Submitted", "Title"]
     missing = [c for c in required if c not in raw.columns]
     if missing:
         raise ValueError("Missing required Excel columns: " + ", ".join(missing))
-
-    # Make optional columns available even if an older workbook omitted them.
-    optional_columns = [
-        "Department", "Description", "Categories (PQCDSM)", "Technique Used",
-        "Status", "Decided By", "Decision Date", "Date Implemented",
-        "Tangible Value (LKR/yr)", "Reward Given", "Reward Value (LKR)",
-    ]
-    for col in optional_columns:
-        if col not in raw.columns:
-            raw[col] = None
 
     engine = get_engine()
     existing_df = pd.read_sql(
@@ -397,10 +588,12 @@ def import_legacy_excel(uploaded_file):
 
     existing_keys = set()
     existing_legacy_nos = set()
+
     for _, r in existing_df.iterrows():
         legacy_no = pd.to_numeric(r.get("legacy_no"), errors="coerce")
         if pd.notna(legacy_no):
             existing_legacy_nos.add(int(legacy_no))
+
         d = pd.to_datetime(r.get("date_submitted"), errors="coerce")
         existing_keys.add((
             str(r.get("submitted_by") or "").strip().lower(),
@@ -412,9 +605,10 @@ def import_legacy_excel(uploaded_file):
     imported = skipped = 0
     errors = []
 
-    # Import ALL rows, not just the first 10 shown in the preview.
+    # Import ALL rows, not only the preview.
     for n, r in raw.iterrows():
         excel_row = n + 2
+
         try:
             legacy_raw = pd.to_numeric(r.get("No"), errors="coerce")
             legacy_no = int(legacy_raw) if pd.notna(legacy_raw) else None
@@ -428,6 +622,7 @@ def import_legacy_excel(uploaded_file):
 
             title = _clean_excel_value(r.get("Title"))
             description = _clean_excel_value(r.get("Description"))
+
             if not title:
                 skipped += 1
                 errors.append(f"Excel row {excel_row}: Title is empty.")
@@ -440,16 +635,25 @@ def import_legacy_excel(uploaded_file):
                 str(description or "").strip().lower(),
             )
 
-            # Prefer the original Excel No. when available; otherwise use the
-            # content key. This makes re-uploading the same 173-row workbook safe.
-            if (legacy_no is not None and legacy_no in existing_legacy_nos) or key in existing_keys:
+            # Prefer Excel No when available; otherwise use content key.
+            if (
+                legacy_no is not None and legacy_no in existing_legacy_nos
+            ) or key in existing_keys:
                 skipped += 1
                 continue
 
-            approval = pd.to_datetime(r.get("Decision Date"), errors="coerce")
-            implemented = pd.to_datetime(r.get("Date Implemented"), errors="coerce")
-            tangible = pd.to_numeric(r.get("Tangible Value (LKR/yr)"), errors="coerce")
-            reward_value = pd.to_numeric(r.get("Reward Value (LKR)"), errors="coerce")
+            approval = pd.to_datetime(
+                r.get("Decision Date"), errors="coerce"
+            )
+            implemented = pd.to_datetime(
+                r.get("Date Implemented"), errors="coerce"
+            )
+            tangible = pd.to_numeric(
+                r.get("Tangible Value (LKR/yr)"), errors="coerce"
+            )
+            reward_value = pd.to_numeric(
+                r.get("Reward Value (LKR)"), errors="coerce"
+            )
 
             row = {
                 "legacy_no": legacy_no,
@@ -459,30 +663,53 @@ def import_legacy_excel(uploaded_file):
                 "date_submitted": date_submitted,
                 "title": str(title),
                 "description": description,
-                "category": _clean_excel_value(r.get("Categories (PQCDSM)")),
-                "technique_used": _clean_excel_value(r.get("Technique Used")),
+                "category": _clean_excel_value(
+                    r.get("Categories (PQCDSM)")
+                ),
+                "technique_used": _clean_excel_value(
+                    r.get("Technique Used")
+                ),
                 "status": _normalize_status(r.get("Status")),
-                "tangible_value": float(tangible) if pd.notna(tangible) else 0.0,
+                "tangible_value": (
+                    float(tangible) if pd.notna(tangible) else 0.0
+                ),
                 "reward": _clean_excel_value(r.get("Reward Given")),
-                "reward_value": float(reward_value) if pd.notna(reward_value) else 0.0,
+                "reward_value": (
+                    float(reward_value) if pd.notna(reward_value) else 0.0
+                ),
                 "approver": _clean_excel_value(r.get("Decided By")),
-                "approval_date": approval.to_pydatetime() if pd.notna(approval) else None,
-                "date_implemented": implemented.date() if pd.notna(implemented) else None,
+                "approval_date": (
+                    approval.to_pydatetime()
+                    if pd.notna(approval)
+                    else None
+                ),
+                "date_implemented": (
+                    implemented.date()
+                    if pd.notna(implemented)
+                    else None
+                ),
                 "ai_note": "Imported from existing Kaizen Excel workbook",
-                "created_at": datetime.combine(date_submitted, datetime.min.time()) if date_submitted else datetime.now(),
+                "created_at": (
+                    datetime.combine(date_submitted, datetime.min.time())
+                    if date_submitted
+                    else datetime.now()
+                ),
             }
 
             insert_suggestion(row)
+
             existing_keys.add(key)
             if legacy_no is not None:
                 existing_legacy_nos.add(legacy_no)
+
             imported += 1
+
         except Exception as exc:
             errors.append(f"Excel row {excel_row}: {exc}")
 
     return imported, skipped, errors
 
- 
+
 def insert_suggestion(row: dict) -> int:
     # New web-submitted suggestions do not use the legacy Excel number.
     # Keep the field nullable so both imported and new records work.
@@ -1345,13 +1572,27 @@ def page_import_excel():
         st.info("Make sure **openpyxl>=3.1** is in requirements.txt and redeploy the app.")
         return
 
+    # _read_uploaded_excel() already detects the real header row and maps
+    # common historical column names to the app's standard names.
     required = ["Name", "Role", "Date Submitted", "Title"]
     missing = [c for c in required if c not in preview.columns]
     if missing:
-        st.error("This workbook is missing required columns: " + ", ".join(missing))
+        detected = ", ".join(str(c) for c in preview.columns if str(c).strip())
+        st.error(
+            "This workbook could not be mapped to the required Kaizen fields. "
+            f"Missing: {', '.join(missing)}"
+        )
+        st.caption(
+            "The importer accepts common variations such as Employee Name, "
+            "Submitted By, Suggestion Title, Submission Date, Plant/Site, etc."
+        )
+        if detected:
+            st.caption(f"Detected columns: {detected}")
         return
 
-    st.success(f"Excel file read successfully — {len(preview):,} individual suggestion rows found.")
+    st.success(
+        f"Excel file read successfully — {len(preview):,} individual suggestion rows found."
+    )
     st.caption("The import will process every suggestion row in the **Kaizen Suggestions** sheet, not only the rows shown in this preview. All suggestion fields are copied to PostgreSQL.")
     st.dataframe(preview.head(10), use_container_width=True, hide_index=True)
 
