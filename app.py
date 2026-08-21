@@ -201,6 +201,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 legacy_no INTEGER NULL,
                 submitted_by VARCHAR(150) NOT NULL,
+                entered_by VARCHAR(150),
                 employee_type VARCHAR(50),
                 department VARCHAR(100) NOT NULL,
                 date_submitted DATE,
@@ -234,6 +235,7 @@ def init_db():
                 id SERIAL PRIMARY KEY,
                 legacy_no INTEGER NULL,
                 submitted_by VARCHAR(150) NOT NULL,
+                entered_by VARCHAR(150),
                 employee_type VARCHAR(50),
                 department VARCHAR(100) NOT NULL,
                 date_submitted DATE,
@@ -321,6 +323,7 @@ def ensure_optional_columns():
     engine=get_engine()
     required={
         "legacy_no": "INTEGER",
+        "entered_by": "VARCHAR(150)",
         "date_implemented": "DATE" if engine.dialect.name=="postgresql" else "DATETIME",
         "reward_value": "DECIMAL(14,2)",
     }
@@ -367,6 +370,10 @@ EXCEL_COLUMN_ALIASES = {
     "Name": [
         "name", "employee name", "submitted by", "suggested by",
         "suggested by name", "employee"
+    ],
+    "Entered By": [
+        "entered by", "entered by name", "logged by", "recorded by",
+        "data entered by", "captured by"
     ],
     "Role": [
         "role", "employee role", "employee type", "staff type",
@@ -552,7 +559,7 @@ def _read_uploaded_excel(uploaded_file) -> pd.DataFrame:
 
     # These fields are optional in older workbooks.
     optional_columns = [
-        "No", "Department", "Description", "Categories (PQCDSM)",
+        "No", "Entered By", "Department", "Description", "Categories (PQCDSM)",
         "Technique Used", "Status", "Decided By", "Decision Date",
         "Date Implemented", "Tangible Value (LKR/yr)", "Reward Given",
         "Reward Value (LKR)",
@@ -614,6 +621,7 @@ def import_legacy_excel(uploaded_file):
             legacy_no = int(legacy_raw) if pd.notna(legacy_raw) else None
 
             submitted_by = _clean_excel_value(r.get("Name")) or "Not specified"
+            entered_by = _clean_excel_value(r.get("Entered By")) or "Imported from Excel"
             employee_type = _normalize_employee_type(r.get("Role"))
             department = _clean_excel_value(r.get("Department")) or "Not specified"
 
@@ -658,6 +666,7 @@ def import_legacy_excel(uploaded_file):
             row = {
                 "legacy_no": legacy_no,
                 "submitted_by": str(submitted_by),
+                "entered_by": str(entered_by),
                 "employee_type": employee_type,
                 "department": str(department),
                 "date_submitted": date_submitted,
@@ -720,10 +729,10 @@ def insert_suggestion(row: dict) -> int:
     is_postgres = engine.dialect.name == "postgresql"
  
     sql = """INSERT INTO suggestions
-             (legacy_no, submitted_by, employee_type, department, date_submitted, title, description,
+             (legacy_no, submitted_by, entered_by, employee_type, department, date_submitted, title, description,
               category, technique_used, status, tangible_value, reward, reward_value,
               approver, approval_date, date_implemented, ai_note, created_at)
-             VALUES (:legacy_no,:submitted_by,:employee_type,:department,:date_submitted,:title,:description,
+             VALUES (:legacy_no,:submitted_by,:entered_by,:employee_type,:department,:date_submitted,:title,:description,
                      :category,:technique_used,:status,:tangible_value,:reward,:reward_value,
                      :approver,:approval_date,:date_implemented,:ai_note,:created_at)"""
     if is_postgres:
@@ -736,6 +745,27 @@ def insert_suggestion(row: dict) -> int:
         return result.lastrowid
  
  
+def update_suggestion_details(sug_id, suggested_by, title, description, date_submitted, department, employee_type):
+    """Allow an authorized approver to correct suggestion details."""
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(
+            text("""UPDATE suggestions
+                    SET submitted_by=:submitted_by, title=:title, description=:description,
+                        date_submitted=:date_submitted, department=:department, employee_type=:employee_type
+                    WHERE id=:id"""),
+            {
+                "submitted_by": suggested_by.strip(),
+                "title": title.strip(),
+                "description": description.strip(),
+                "date_submitted": date_submitted,
+                "department": department.strip(),
+                "employee_type": employee_type,
+                "id": sug_id,
+            },
+        )
+
+
 def update_suggestion_decision(sug_id, status, approver, tangible_value, reward, technique_used):
     engine = get_engine()
     with engine.begin() as conn:
@@ -926,11 +956,11 @@ def qr_expander():
 # Public (anonymous) pages — Staff / GEMBA
 # --------------------------------------------------------------------------- #
 def staff_access():
-    """Collect GEMBA/staff identity and the HOF/plant site."""
+    """Collect the person entering the record, plant/site, and employee type."""
     st.subheader("👤 GEMBA / Staff Access")
     st.caption(
-        "Enter the name of the person who suggested the idea and select the plant/site. "
-        "You can also add a new plant if it is not in the list."
+        "Enter the name of the person who is recording the suggestion. "
+        "The actual suggestion owner can be different and will be entered on the next screen."
     )
 
     plant_options = DEPARTMENTS + ["➕ Add New Plant"]
@@ -939,9 +969,10 @@ def staff_access():
 
     with st.form("staff_access_form", clear_on_submit=False):
         name = st.text_input(
-            "Suggested by *",
-            placeholder="Enter the name of the person who suggested the idea",
+            "Entered by *",
+            placeholder="e.g. Shanaka",
             value=st.session_state.get("staff_name") or "",
+            help="This is the person who is entering the suggestion into the system.",
         )
         selected_site = st.selectbox(
             "HOF / Plant Site *",
@@ -974,7 +1005,10 @@ def staff_access():
         department = (new_plant if selected_site == "➕ Add New Plant" else selected_site).strip()
 
         if not name:
-            st.error("Please enter the name of the person who suggested the idea.")
+            st.error("Please enter the name of the person entering the suggestion.")
+            return False
+        if len(name) > 150:
+            st.error("Name must be 150 characters or fewer.")
             return False
         if not department:
             st.error("Please enter a plant/site name.")
@@ -983,16 +1017,14 @@ def staff_access():
             st.error("Plant/site name must be 100 characters or fewer.")
             return False
 
-        with st.spinner("Processing GEMBA access..."):
-            st.session_state["role"] = "staff"
-            st.session_state["staff_name"] = name
-            st.session_state["staff_department"] = department
-            st.session_state["staff_employee_type"] = employee_type
-            st.session_state["staff_access_granted"] = True
+        st.session_state["role"] = "staff"
+        st.session_state["staff_name"] = name
+        st.session_state["staff_department"] = department
+        st.session_state["staff_employee_type"] = employee_type
+        st.session_state["staff_access_granted"] = True
         st.rerun()
 
     return False
-
 
 def page_site_implemented():
     """Show all Kaizen suggestions recorded for the currently selected plant/site."""
@@ -1072,6 +1104,9 @@ def page_site_implemented():
             c5.caption(f"🛠️ Technique: {r['technique_used'] or '—'}")
             c6.caption(f"💰 Tangible value: Rs {float(r['tangible_value'] or 0):,.0f}")
 
+            if r.get("entered_by"):
+                st.caption(f"📝 Entered by: {r['entered_by']}")
+
             if r["approver"]:
                 st.caption(f"👤 Reviewed by: {r['approver']}")
 
@@ -1089,27 +1124,35 @@ def page_site_implemented():
  
  
 def page_log_suggestion():
-    """Suggestion form. Staff identity is taken from the authenticated session."""
+    """Create a suggestion while keeping the recorder and suggestion owner separate."""
     st.subheader("💡 New Kaizen Suggestion")
- 
-    staff_name = st.session_state.get("staff_name")
+
+    entered_by = st.session_state.get("staff_name")
     staff_department = st.session_state.get("staff_department")
     staff_employee_type = st.session_state.get("staff_employee_type")
- 
-    if not staff_name or not staff_department or not staff_employee_type:
+
+    if not entered_by or not staff_department or not staff_employee_type:
         st.warning("Please complete GEMBA / Staff Access before logging a suggestion.")
         if st.button("Go to GEMBA / Staff Access", type="primary"):
             st.session_state["role"] = None
             st.rerun()
         return
- 
+
     c1, c2, c3 = st.columns(3)
-    c1.metric("Suggested by", staff_name)
+    c1.metric("Entered by", entered_by)
     c2.metric("Department", staff_department)
     c3.metric("Employee Type", staff_employee_type)
-    st.caption("The suggestion can be entered by any person on behalf of the person named above.")
- 
+    st.caption("The person entering the record may be different from the person who actually suggested the idea.")
+
     with st.form("log_suggestion_form", clear_on_submit=True):
+        suggested_by = st.text_input(
+            "Suggested by *",
+            value=entered_by,
+            placeholder="e.g. Udana",
+            help="This field is editable. If Shanaka is entering Udana's idea, keep Entered by = Shanaka and change Suggested by to Udana.",
+        )
+        st.caption("✏️ You can change this name. The person entering the record and the person who suggested the idea can be different.")
+
         c1, c2 = st.columns(2)
         with c1:
             title = st.text_input(
@@ -1126,34 +1169,42 @@ def page_log_suggestion():
                 TECHNIQUES,
             )
             category = st.multiselect("Category (PQCDSM)", CATEGORIES)
- 
+
         description = st.text_area(
             "Description *",
             placeholder="What is the idea, what problem does it solve, and what improvement is expected?",
             height=140,
         )
- 
+
         submitted = st.form_submit_button(
             "🚀 Submit Suggestion",
             type="primary",
             use_container_width=True,
         )
- 
+
     if submitted:
+        suggested_by = suggested_by.strip()
+        if not suggested_by:
+            st.error("Please enter the name of the person who suggested the idea.")
+            return
+        if len(suggested_by) > 150:
+            st.error("Suggested-by name must be 150 characters or fewer.")
+            return
         if not title.strip():
             st.error("Please enter a suggestion title.")
             return
         if not description.strip():
             st.error("Please enter a description.")
             return
- 
+
         with st.spinner("Processing and saving your suggestion..."):
             ai_category, ai_note = ai_review(description)
             final_category = category if category else ([ai_category] if ai_category else [])
- 
+
             row = {
                 "legacy_no": None,
-                "submitted_by": staff_name,
+                "submitted_by": suggested_by,
+                "entered_by": entered_by,
                 "employee_type": staff_employee_type,
                 "department": staff_department,
                 "date_submitted": date_submitted,
@@ -1171,22 +1222,21 @@ def page_log_suggestion():
                 "ai_note": ai_note,
                 "created_at": datetime.now(),
             }
- 
+
             try:
                 new_id = insert_suggestion(row)
             except Exception as e:
                 st.error(f"Could not save the suggestion: {e}")
                 return
- 
+
         st.success(f"Suggestion #{new_id} submitted successfully. Thank you!")
         st.info(
-            "Your suggestion has been saved and is visible only to authorized approvers. "
-            f"Your reference ID is **#{new_id}**."
+            f"Suggested by **{suggested_by}** · Entered by **{entered_by}**. "
+            f"Reference ID: **#{new_id}**."
         )
         if ai_note:
             st.info(f"AI note: {ai_note}")
- 
- 
+
 def page_track_suggestions():
     st.subheader("Suggestion Tracking")
     st.info(
@@ -1431,9 +1481,9 @@ def page_dashboard():
     if site_df.empty:
         st.info("No suggestions for this plant/site.")
     else:
-        recent = site_df[["id","date_submitted","submitted_by","department","title","status","approver","approval_date"]].head(10).copy()
-        recent.columns = ["ID","Submitted","Submitted By","Department","Suggestion","Status","Decided By","Decision Date"]
-        st.dataframe(recent, use_container_width=True, hide_index=True)
+        recent = site_df[["id","date_submitted","submitted_by","entered_by","department","title","status","approver","approval_date"]].head(10).copy()
+        recent.columns = ["ID","Submitted","Submitted By","Entered By","Department","Suggestion","Status","Decided By","Decision Date"]
+        st.dataframe(recent, use_container_width=True, hide_index=True, column_config=kaizen_table_column_config())
 
 
 def page_approvals():
@@ -1487,6 +1537,44 @@ def page_approvals():
                 st.rerun()
  
  
+def kaizen_table_column_config():
+    """Readable/resizable columns for Kaizen tables.
+
+    Streamlit still lets users drag the column borders. These defaults make
+    the important name and monetary columns wide enough to show their values
+    without truncation.
+    """
+    return {
+        "Database ID": st.column_config.NumberColumn("Database ID", width="small", format="%d"),
+        "Excel No.": st.column_config.NumberColumn("Excel No.", width="small", format="%d"),
+        "Submitted Date": st.column_config.DateColumn("Submitted Date", width="medium", format="DD/MM/YYYY"),
+        "Submitted By": st.column_config.TextColumn("Suggested By", width="medium"),
+        "Entered By": st.column_config.TextColumn("Entered By", width="medium"),
+        "Employee Type": st.column_config.TextColumn("Employee Type", width="medium"),
+        "HOF / Plant Site": st.column_config.TextColumn("HOF / Plant Site", width="medium"),
+        "Department": st.column_config.TextColumn("Department", width="medium"),
+        "Suggestion": st.column_config.TextColumn("Suggestion", width="large"),
+        "Title": st.column_config.TextColumn("Title", width="large"),
+        "Category": st.column_config.TextColumn("Category", width="medium"),
+        "Technique": st.column_config.TextColumn("Technique", width="medium"),
+        "Status": st.column_config.TextColumn("Status", width="medium"),
+        "Tangible Value (LKR)": st.column_config.NumberColumn(
+            "Tangible Value (LKR)",
+            width="large",
+            format="Rs %,.2f",
+            help="Full tangible value. Drag the column border to make it wider or narrower.",
+        ),
+        "Reward Value (LKR)": st.column_config.NumberColumn(
+            "Reward Value (LKR)", width="large", format="Rs %,.2f"
+        ),
+        "Reward / Recognition": st.column_config.TextColumn("Reward / Recognition", width="large"),
+        "Reward": st.column_config.TextColumn("Reward", width="large"),
+        "Decided By": st.column_config.TextColumn("Decided By", width="medium"),
+        "Decision Date": st.column_config.DatetimeColumn("Decision Date", width="medium", format="DD/MM/YYYY HH:mm"),
+        "Date Implemented": st.column_config.DateColumn("Date Implemented", width="medium", format="DD/MM/YYYY"),
+    }
+
+
 def page_all_suggestions():
     st.subheader("All Suggestions")
     df = df_suggestions()
@@ -1523,17 +1611,24 @@ def page_all_suggestions():
     st.caption("Use HOF / Plant Site and Year filters to find suggestions. Years from 2000 to the current year are available.")
     st.caption(f"Showing **{len(view):,}** of **{len(df):,}** suggestions.")
 
-    show = view[["id", "legacy_no", "date_submitted", "submitted_by", "employee_type", "department", "title",
+    show = view[["id", "legacy_no", "date_submitted", "submitted_by", "entered_by", "employee_type", "department", "title",
                  "category", "technique_used", "status", "tangible_value", "reward", "reward_value",
                  "approver", "approval_date", "date_implemented"]].rename(columns={
         "id": "Database ID", "legacy_no": "Excel No.", "date_submitted": "Submitted Date", "submitted_by": "Submitted By",
-        "employee_type": "Employee Type", "department": "HOF / Plant Site", "title": "Suggestion",
+        "entered_by": "Entered By", "employee_type": "Employee Type", "department": "HOF / Plant Site", "title": "Suggestion",
         "category": "Category", "technique_used": "Technique", "status": "Status",
         "tangible_value": "Tangible Value (LKR)", "reward": "Reward / Recognition",
         "reward_value": "Reward Value (LKR)", "approver": "Decided By",
         "approval_date": "Decision Date", "date_implemented": "Date Implemented",
     })
-    st.dataframe(show, use_container_width=True, hide_index=True)
+    show["Tangible Value (LKR)"] = pd.to_numeric(show["Tangible Value (LKR)"], errors="coerce").fillna(0)
+    show["Reward Value (LKR)"] = pd.to_numeric(show["Reward Value (LKR)"], errors="coerce").fillna(0)
+    st.dataframe(
+        show,
+        use_container_width=True,
+        hide_index=True,
+        column_config=kaizen_table_column_config(),
+    )
 
     csv = show.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Export filtered suggestions as CSV", csv, "kaizen_suggestions_filtered.csv", "text/csv")
@@ -1548,8 +1643,83 @@ def page_all_suggestions():
             "id": "ID", "title": "Title", "status": "Status", "approver": "Decided By",
             "approval_date": "Decision Date", "tangible_value": "Tangible Value (LKR)", "reward": "Reward",
         }).sort_values("Decision Date", ascending=False)
-        st.dataframe(decided_show, use_container_width=True, hide_index=True)
+        decided_show["Tangible Value (LKR)"] = pd.to_numeric(decided_show["Tangible Value (LKR)"], errors="coerce").fillna(0)
+        st.dataframe(decided_show, use_container_width=True, hide_index=True, column_config=kaizen_table_column_config())
 
+
+
+def page_edit_suggestions():
+    """Allow approvers to correct suggestion ownership/details without changing the audit decision."""
+    st.subheader("✏️ Edit Suggestions")
+    st.caption("Use this page to correct the Suggested by name when someone entered another person's idea.")
+
+    df = df_suggestions()
+    if df.empty:
+        st.info("No suggestions logged yet.")
+        return
+
+    for _, r in df.iterrows():
+        entered_by = r.get("entered_by") or "Not recorded"
+        with st.expander(
+            f"#{r['id']} — {r['title'] or 'Untitled'} · Suggested by: {r['submitted_by'] or 'Not specified'}"
+        ):
+            st.caption(f"Entered by: {entered_by} · Status: {r['status']} · Plant/Site: {r['department']}")
+
+            with st.form(f"edit_suggestion_{r['id']}"):
+                suggested_by = st.text_input(
+                    "Suggested by *",
+                    value=str(r.get("submitted_by") or ""),
+                )
+                title = st.text_input(
+                    "Suggestion title *",
+                    value=str(r.get("title") or ""),
+                )
+                description = st.text_area(
+                    "Description *",
+                    value=str(r.get("description") or ""),
+                    height=120,
+                )
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    current_date = pd.to_datetime(r.get("date_submitted"), errors="coerce")
+                    default_date = current_date.date() if pd.notna(current_date) else date.today()
+                    edit_date = st.date_input("Date submitted", value=default_date)
+                with c2:
+                    employee_options = ["GEMBA Worker", "Staff"]
+                    current_type = str(r.get("employee_type") or "Staff")
+                    type_index = employee_options.index(current_type) if current_type in employee_options else 0
+                    edit_employee_type = st.selectbox("Employee type", employee_options, index=type_index)
+
+                site = st.text_input(
+                    "HOF / Plant Site *",
+                    value=str(r.get("department") or ""),
+                )
+
+                save_clicked = st.form_submit_button("💾 Save Changes", type="primary")
+
+            if save_clicked:
+                suggested_by = suggested_by.strip()
+                title = title.strip()
+                description = description.strip()
+                site = site.strip()
+
+                if not suggested_by or not title or not description or not site:
+                    st.error("Suggested by, title, description and plant/site are required.")
+                    continue
+                if len(suggested_by) > 150 or len(site) > 100:
+                    st.error("Suggested-by name must be 150 characters or fewer and plant/site 100 characters or fewer.")
+                    continue
+
+                try:
+                    update_suggestion_details(
+                        int(r["id"]), suggested_by, title, description,
+                        edit_date, site, edit_employee_type
+                    )
+                    st.success(f"Suggestion #{r['id']} updated successfully.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not update suggestion #{r['id']}: {exc}")
 
 
 def page_import_excel():
@@ -1594,7 +1764,12 @@ def page_import_excel():
         f"Excel file read successfully — {len(preview):,} individual suggestion rows found."
     )
     st.caption("The import will process every suggestion row in the **Kaizen Suggestions** sheet, not only the rows shown in this preview. All suggestion fields are copied to PostgreSQL.")
-    st.dataframe(preview.head(10), use_container_width=True, hide_index=True)
+    st.dataframe(
+        preview.head(10),
+        use_container_width=True,
+        hide_index=True,
+        column_config=kaizen_table_column_config(),
+    )
 
     missing_dept_count = int(preview["Department"].isna().sum()) if "Department" in preview.columns else len(preview)
     if missing_dept_count:
@@ -1762,7 +1937,7 @@ def approver_shell():
         st.divider()
         page = st.radio("Navigation", [
             "📊 Dashboard", "📝 Pending Approvals", "🟢 Approved", "🔴 Rejected",
-            "🔵 Implemented", "📋 All Suggestions", "📥 Import Excel", "⚙️ Manage Approvers"
+            "🔵 Implemented", "📋 All Suggestions", "✏️ Edit Suggestions", "📥 Import Excel", "⚙️ Manage Approvers"
         ], label_visibility="collapsed")
  
     if page == "📊 Dashboard":
@@ -1771,6 +1946,8 @@ def approver_shell():
         page_approvals()
     elif page == "📋 All Suggestions":
         page_all_suggestions()
+    elif page == "✏️ Edit Suggestions":
+        page_edit_suggestions()
     elif page == "📥 Import Excel":
         page_import_excel()
     elif page == "⚙️ Manage Approvers":
@@ -1787,15 +1964,17 @@ def page_status_history(status: str):
     if view.empty:
         st.info(f"No {status.lower()} suggestions yet.")
         return
-    show = view[["id","date_submitted","submitted_by","employee_type","department","title","category","technique_used","approver","approval_date","date_implemented","tangible_value","reward","reward_value"]].rename(columns={
-        "id":"ID", "date_submitted":"Submitted Date", "submitted_by":"Submitted By",
+    show = view[["id","date_submitted","submitted_by","entered_by","employee_type","department","title","category","technique_used","approver","approval_date","date_implemented","tangible_value","reward","reward_value"]].rename(columns={
+        "id":"ID", "date_submitted":"Submitted Date", "submitted_by":"Submitted By", "entered_by":"Entered By",
         "employee_type":"Employee Type", "department":"Department", "title":"Suggestion",
         "category":"Category", "technique_used":"Technique", "approver":"Decided By",
         "approval_date":"Decision Date", "date_implemented":"Date Implemented",
         "tangible_value":"Tangible Value (LKR)", "reward":"Reward / Recognition",
         "reward_value":"Reward Value (LKR)"
     }).sort_values("Decision Date", ascending=False)
-    st.dataframe(show, use_container_width=True, hide_index=True)
+    show["Tangible Value (LKR)"] = pd.to_numeric(show["Tangible Value (LKR)"], errors="coerce").fillna(0)
+    show["Reward Value (LKR)"] = pd.to_numeric(show["Reward Value (LKR)"], errors="coerce").fillna(0)
+    st.dataframe(show, use_container_width=True, hide_index=True, column_config=kaizen_table_column_config())
     st.download_button(f"⬇️ Export {status} suggestions", show.to_csv(index=False).encode("utf-8"), f"kaizen_{status.lower()}_suggestions.csv", "text/csv")
  
  
