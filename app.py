@@ -4,9 +4,10 @@ PostgreSQL-backed Streamlit app.
  
 Access model
 ------------
-Staff / GEMBA worker : NO account or password required. They must enter
-                        their name and department when submitting. They cannot
-                        browse, search, or view other suggestions.
+Staff / GEMBA worker : Uses a self-registered account (username + password).
+                        Their registered name, plant/site, and employee type are
+                        loaded automatically. They cannot browse, search, or view
+                        other suggestions beyond their site view.
  
 Approver              : Signs in with a username + password. On an
                         approver's very first sign-in there is no password
@@ -201,7 +202,6 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 legacy_no INTEGER NULL,
                 submitted_by VARCHAR(150) NOT NULL,
-                submitted_by_username VARCHAR(50),
                 entered_by VARCHAR(150),
                 employee_type VARCHAR(50),
                 department VARCHAR(100) NOT NULL,
@@ -231,7 +231,7 @@ def init_db():
         """
         staff_accounts_ddl = """
             CREATE TABLE IF NOT EXISTS staff_accounts (
-                username VARCHAR(50) PRIMARY KEY,
+                username VARCHAR(80) PRIMARY KEY,
                 display_name VARCHAR(150) NOT NULL,
                 password_hash VARCHAR(255) NOT NULL,
                 department VARCHAR(100) NOT NULL,
@@ -247,7 +247,6 @@ def init_db():
                 id SERIAL PRIMARY KEY,
                 legacy_no INTEGER NULL,
                 submitted_by VARCHAR(150) NOT NULL,
-                submitted_by_username VARCHAR(50),
                 entered_by VARCHAR(150),
                 employee_type VARCHAR(50),
                 department VARCHAR(100) NOT NULL,
@@ -277,13 +276,13 @@ def init_db():
         """
         staff_accounts_ddl = """
             CREATE TABLE IF NOT EXISTS staff_accounts (
-                username VARCHAR(50) PRIMARY KEY,
+                username VARCHAR(80) PRIMARY KEY,
                 display_name VARCHAR(150) NOT NULL,
                 password_hash VARCHAR(255) NOT NULL,
                 department VARCHAR(100) NOT NULL,
                 employee_type VARCHAR(50) NOT NULL,
                 active BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """
  
@@ -333,6 +332,7 @@ def init_db():
             )
 
     ensure_optional_columns()
+    ensure_staff_account_columns()
 
 
 # --------------------------------------------------------------------------- #
@@ -351,13 +351,38 @@ def ensure_optional_columns():
         "entered_by": "VARCHAR(150)",
         "date_implemented": "DATE" if engine.dialect.name=="postgresql" else "DATETIME",
         "reward_value": "DECIMAL(14,2)",
-        "submitted_by_username": "VARCHAR(50)",
+        "submitted_by_username": "VARCHAR(80)",
+        "entered_by_username": "VARCHAR(80)",
     }
     existing={c["name"] for c in sa.inspect(engine).get_columns("suggestions")}
     with engine.begin() as conn:
         for name, dtype in required.items():
             if name not in existing:
                 conn.execute(text(f"ALTER TABLE suggestions ADD COLUMN {name} {dtype}"))
+
+def ensure_staff_account_columns():
+    """Create/migrate staff_accounts so old deployments cannot fail on missing columns."""
+    engine = get_engine()
+    inspector = sa.inspect(engine)
+    if "staff_accounts" not in inspector.get_table_names():
+        return
+    existing = {c["name"] for c in inspector.get_columns("staff_accounts")}
+    is_postgres = engine.dialect.name == "postgresql"
+    additions = {
+        "display_name": "VARCHAR(150)",
+        "password_hash": "VARCHAR(255)",
+        "department": "VARCHAR(100)",
+        "employee_type": "VARCHAR(50)",
+        "active": "BOOLEAN DEFAULT TRUE" if is_postgres else "INTEGER DEFAULT 1",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP" if is_postgres else "DATETIME",
+    }
+    with engine.begin() as conn:
+        for name, dtype in additions.items():
+            if name not in existing:
+                conn.execute(text(f"ALTER TABLE staff_accounts ADD COLUMN {name} {dtype}"))
+        if "display_name" not in existing and "name" in existing:
+            conn.execute(text("UPDATE staff_accounts SET display_name=name WHERE display_name IS NULL"))
+
 
 def _clean_excel_value(value):
     if pd.isna(value): return None
@@ -746,32 +771,26 @@ def import_legacy_excel(uploaded_file):
 
 
 def insert_suggestion(row: dict) -> int:
-    # New web-submitted suggestions do not use the legacy Excel number.
-    # Keep the field nullable so both imported and new records work.
     row = dict(row)
     row.setdefault("legacy_no", None)
     row.setdefault("submitted_by_username", None)
-
+    row.setdefault("entered_by_username", None)
     engine = get_engine()
     is_postgres = engine.dialect.name == "postgresql"
- 
     sql = """INSERT INTO suggestions
-             (legacy_no, submitted_by, submitted_by_username, entered_by, employee_type, department, date_submitted, title, description,
-              category, technique_used, status, tangible_value, reward, reward_value,
-              approver, approval_date, date_implemented, ai_note, created_at)
-             VALUES (:legacy_no,:submitted_by,:submitted_by_username,:entered_by,:employee_type,:department,:date_submitted,:title,:description,
-                     :category,:technique_used,:status,:tangible_value,:reward,:reward_value,
-                     :approver,:approval_date,:date_implemented,:ai_note,:created_at)"""
+             (legacy_no, submitted_by, submitted_by_username, entered_by, entered_by_username,
+              employee_type, department, date_submitted, title, description, category, technique_used, status,
+              tangible_value, reward, reward_value, approver, approval_date, date_implemented, ai_note, created_at)
+             VALUES (:legacy_no,:submitted_by,:submitted_by_username,:entered_by,:entered_by_username,
+                     :employee_type,:department,:date_submitted,:title,:description,:category,:technique_used,:status,
+                     :tangible_value,:reward,:reward_value,:approver,:approval_date,:date_implemented,:ai_note,:created_at)"""
     if is_postgres:
         sql += " RETURNING id"
- 
     with engine.begin() as conn:
         result = conn.execute(text(sql), row)
         if is_postgres:
             return result.scalar_one()
         return result.lastrowid
- 
- 
 def update_suggestion_details(sug_id, suggested_by, title, description, date_submitted, department, employee_type):
     """Allow an authorized approver to correct suggestion details."""
     engine = get_engine()
@@ -882,7 +901,7 @@ def get_staff_account(username: str):
 
 def verify_staff(username: str, password: str):
     row = get_staff_account(username)
-    if row and row["active"] and row["password_hash"] == hash_pw(password):
+    if row and bool(row.get("active")) and row.get("password_hash") == hash_pw(password):
         return row
     return None
 
@@ -893,10 +912,9 @@ def add_staff_account(username: str, display_name: str, password: str, departmen
         with engine.begin() as conn:
             conn.execute(text("""INSERT INTO staff_accounts
                 (username, display_name, password_hash, department, employee_type, active, created_at)
-                VALUES (:u, :d, :p, :dept, :etype, :active, :created_at)"""), {
+                VALUES (:u,:d,:p,:dept,:etype,:active,:created)"""), {
                 "u": username.strip().lower(), "d": display_name.strip(), "p": hash_pw(password),
-                "dept": department.strip(), "etype": employee_type, "active": True, "created_at": datetime.now(),
-            })
+                "dept": department.strip(), "etype": employee_type.strip(), "active": True, "created": datetime.now()})
         return True
     except sa.exc.IntegrityError:
         return False
@@ -906,14 +924,18 @@ def registered_staff_choices():
     df = df_staff_accounts()
     if df.empty:
         return []
-    return [
-        {
-            "label": f"{r['display_name']} — {r['username']}" + (f" · {r['department']}" if r.get("department") else ""),
-            "username": r["username"], "display_name": r["display_name"],
-            "department": r["department"], "employee_type": r["employee_type"],
-        }
-        for _, r in df[df["active"] == True].iterrows()
-    ]
+    df = df[df["active"].fillna(False).astype(bool)].copy()
+    return [{
+        "username": str(r["username"]), "display_name": str(r["display_name"]),
+        "department": str(r["department"]), "employee_type": str(r["employee_type"]),
+        "label": f"{r['display_name']} — {r['username']} · {r['department']}",
+    } for _, r in df.iterrows()]
+
+
+def set_staff_active(username: str, active: bool):
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE staff_accounts SET active=:a WHERE username=:u"), {"a": bool(active), "u": username.strip().lower()})
 
 
 # --------------------------------------------------------------------------- #
@@ -976,14 +998,13 @@ def qr_png_bytes(url: str) -> bytes:
 def init_session():
     defaults = {
         "role": None,                  # None, staff, or approver
-        "staff_name": None,
         "staff_username": None,
+        "staff_name": None,
         "staff_department": None,
         "staff_employee_type": None,
         "approver_username": None,
         "approver_display_name": None,
         "pending_first_time_username": None,
-        "staff_login_username": None,
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
@@ -991,8 +1012,8 @@ def init_session():
  
 def logout():
     for k in [
-        "role", "staff_name", "staff_username", "staff_department", "staff_employee_type",
-        "approver_username", "approver_display_name", "pending_first_time_username", "staff_login_username",
+        "role", "staff_username", "staff_name", "staff_department", "staff_employee_type",
+        "approver_username", "approver_display_name", "pending_first_time_username",
     ]:
         st.session_state.pop(k, None)
     init_session()
@@ -1036,25 +1057,23 @@ def qr_expander():
 # Public (anonymous) pages — Staff / GEMBA
 # --------------------------------------------------------------------------- #
 def staff_access():
-    """Registered GEMBA / Staff account login and self-service registration."""
+    """Registered GEMBA / Staff sign-in and self-service account creation."""
     st.subheader("👤 GEMBA / Staff Access")
-    st.caption("Use your registered account. Your registered name, plant/site and employee type are loaded automatically.")
-
-    tab_login, tab_register = st.tabs(["🔐 Sign In", "🆕 Create Registered Account"])
-
-    with tab_login:
+    st.caption("Use your registered account. Your registered name, HOF / plant site, and employee type are loaded automatically.")
+    sign_in_tab, create_tab = st.tabs(["🔐 Sign In", "🆕 Create Registered Account"])
+    with sign_in_tab:
         accounts = registered_staff_choices()
         if not accounts:
-            st.info("No GEMBA / Staff accounts have been registered yet. Create your registered account in the **Create Registered Account** tab.")
+            st.info("No GEMBA / Staff accounts have been registered yet. Create your account in the **Create Registered Account** tab.")
         else:
             labels = [a["label"] for a in accounts]
-            selected = st.selectbox("Registered account *", labels, key="staff_account_select")
-            selected_account = next(a for a in accounts if a["label"] == selected)
+            selected_label = st.selectbox("Registered account *", labels, key="staff_login_account")
+            selected = next(a for a in accounts if a["label"] == selected_label)
             with st.form("staff_signin_form"):
-                password = st.text_input("Password *", type="password", placeholder="Enter your registered password")
-                login_clicked = st.form_submit_button("➡️ Continue", type="primary", use_container_width=True)
-            if login_clicked:
-                user = verify_staff(selected_account["username"], password)
+                password = st.text_input("Password *", type="password")
+                sign_in = st.form_submit_button("🔐 Sign in", type="primary", use_container_width=True)
+            if sign_in:
+                user = verify_staff(selected["username"], password)
                 if not user:
                     st.error("Incorrect password or inactive account.")
                 else:
@@ -1063,45 +1082,40 @@ def staff_access():
                     st.session_state["staff_name"] = user["display_name"]
                     st.session_state["staff_department"] = user["department"]
                     st.session_state["staff_employee_type"] = user["employee_type"]
+                    st.session_state["staff_access_granted"] = True
                     st.rerun()
-
-    with tab_register:
-        st.caption("Create your own registered account. Your username must be unique, but two people may have the same registered name.")
-        with st.form("staff_register_form", clear_on_submit=False):
-            name = st.text_input("Registered name *", placeholder="e.g. Roshan")
-            username = st.text_input("Username *", placeholder="e.g. roshan01", help="Unique login name. Lowercase letters, numbers, dot, underscore and hyphen are allowed.")
-            password1 = st.text_input("Create password *", type="password")
+    with create_tab:
+        st.info("Create your own registered account. Your username must be unique, but different people may have the same name.")
+        plant_options = DEPARTMENTS + ["➕ Add New Plant"]
+        with st.form("create_staff_account_form", clear_on_submit=True):
+            display_name = st.text_input("Registered name *", placeholder="e.g. Roshan")
+            username = st.text_input("Unique username *", placeholder="e.g. roshan01", help="This identifies your account and must be unique.")
+            password1 = st.text_input("Password *", type="password")
             password2 = st.text_input("Confirm password *", type="password")
-            site_options = DEPARTMENTS + ["➕ Add New Plant"]
-            selected_site = st.selectbox("HOF / Plant Site *", site_options, key="register_staff_site")
+            selected_site = st.selectbox("HOF / Plant Site *", plant_options)
             new_plant = ""
             if selected_site == "➕ Add New Plant":
                 new_plant = st.text_input("New Plant / Site Name *", placeholder="e.g. ABC Hydro Power Plant")
             employee_type = st.radio("Employee type *", ["GEMBA Worker", "Staff"], horizontal=True)
-            register_clicked = st.form_submit_button("📝 Create Registered Account", type="primary", use_container_width=True)
-
-        if register_clicked:
-            name = name.strip()
-            username = username.strip().lower()
+            create_clicked = st.form_submit_button("🆕 Create Registered Account", type="primary", use_container_width=True)
+        if create_clicked:
+            display_name = display_name.strip(); username = username.strip().lower()
             department = (new_plant if selected_site == "➕ Add New Plant" else selected_site).strip()
-            if not name or not username or not password1 or not password2 or not department:
+            if not display_name or not username or not password1 or not password2 or not department:
                 st.error("Please complete all required fields.")
-            elif len(name) > 150 or len(department) > 100:
-                st.error("Name must be 150 characters or fewer and plant/site must be 100 characters or fewer.")
-            elif not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{2,49}", username):
-                st.error("Username must be 3–50 characters and use only lowercase letters, numbers, dot, underscore or hyphen.")
-            elif password1 != password2:
-                st.error("Passwords must match.")
+            elif not re.fullmatch(r"[a-z0-9._-]{3,80}", username):
+                st.error("Username must be 3–80 characters and use only lowercase letters, numbers, dot, underscore or hyphen.")
             elif len(password1) < 6:
-                st.error("Please use at least 6 characters for the password.")
-            elif add_staff_account(username, name, password1, department, employee_type):
-                st.success(f"Registered account created for **{name}**. You can now use the Sign In tab.")
-                st.info(f"Username: **{username}** · Plant/Site: **{department}** · Employee type: **{employee_type}**")
+                st.error("Password must be at least 6 characters.")
+            elif password1 != password2:
+                st.error("Passwords do not match.")
+            elif len(display_name) > 150 or len(department) > 100:
+                st.error("Name or plant/site is too long.")
+            elif add_staff_account(username, display_name, password1, department, employee_type):
+                st.success(f"Registered account created for {display_name}. You can now sign in using **{username}**.")
             else:
                 st.error("That username is already registered. Please choose another username.")
-
     return False
-
 def page_site_implemented():
     """Show all Kaizen suggestions recorded for the currently selected plant/site."""
     site = (st.session_state.get("staff_department") or "").strip()
@@ -1202,124 +1216,61 @@ def page_site_implemented():
 def page_log_suggestion():
     """Create a suggestion while keeping the recorder and suggestion owner separate."""
     st.subheader("💡 New Kaizen Suggestion")
-
     entered_by = st.session_state.get("staff_name")
+    entered_by_username = st.session_state.get("staff_username")
     staff_department = st.session_state.get("staff_department")
     staff_employee_type = st.session_state.get("staff_employee_type")
-
-    if not entered_by or not staff_department or not staff_employee_type:
-        st.warning("Please complete GEMBA / Staff Access before logging a suggestion.")
-        if st.button("Go to GEMBA / Staff Access", type="primary"):
-            st.session_state["role"] = None
-            st.rerun()
+    if not entered_by or not entered_by_username or not staff_department or not staff_employee_type:
+        st.warning("Please sign in with your registered GEMBA / Staff account before logging a suggestion.")
         return
-
     c1, c2, c3 = st.columns(3)
-    c1.metric("Entered by", entered_by)
-    c2.metric("Department", staff_department)
-    c3.metric("Employee Type", staff_employee_type)
+    c1.metric("Entered by", entered_by); c2.metric("Department", staff_department); c3.metric("Employee Type", staff_employee_type)
     st.caption("The person entering the record may be different from the person who actually suggested the idea.")
-
     accounts = registered_staff_choices()
     if not accounts:
-        st.error("No registered GEMBA / Staff accounts are available. Create the suggestion owner's registered account first.")
+        st.error("No active registered GEMBA / Staff accounts are available.")
         return
-
-    account_labels = [a["label"] for a in accounts]
-    current_username = st.session_state.get("staff_username")
-    default_idx = next((i for i, a in enumerate(accounts) if a["username"] == current_username), 0)
-
+    labels = [a["label"] for a in accounts]
+    current_label = next((a["label"] for a in accounts if a["username"] == entered_by_username), labels[0])
     with st.form("log_suggestion_form", clear_on_submit=True):
-        selected_owner = st.selectbox(
-            "Suggested by *", account_labels, index=default_idx,
-            help="Select the registered account of the person who actually suggested the idea. Two people may have the same name; their unique usernames keep the accounts separate.",
-        )
-        owner_account = next(a for a in accounts if a["label"] == selected_owner)
-        suggested_by = owner_account["display_name"]
-        suggested_by_username = owner_account["username"]
-        st.caption("The person entering the record and the person who suggested the idea can be different. Select the registered account of the actual suggestion owner.")
-
+        suggested_label = st.selectbox("Suggested by *", labels, index=labels.index(current_label), help="Select the registered person who actually suggested the idea. Unregistered names cannot be entered.")
+        selected_suggester = next(a for a in accounts if a["label"] == suggested_label)
+        st.caption(f"Registered name: **{selected_suggester['display_name']}** · Username: **{selected_suggester['username']}**")
         c1, c2 = st.columns(2)
         with c1:
-            title = st.text_input(
-                "Suggestion title *",
-                placeholder="Short summary of the idea",
-            )
-            date_submitted = st.date_input(
-                "Date submitted",
-                value=date.today(),
-            )
+            title = st.text_input("Suggestion title *", placeholder="Short summary of the idea")
+            date_submitted = st.date_input("Date submitted", value=date.today())
         with c2:
-            technique_used = st.selectbox(
-                "Technique used (optional)",
-                TECHNIQUES,
-            )
+            technique_used = st.selectbox("Technique used (optional)", TECHNIQUES)
             category = st.multiselect("Category (PQCDSM)", CATEGORIES)
-
-        description = st.text_area(
-            "Description *",
-            placeholder="What is the idea, what problem does it solve, and what improvement is expected?",
-            height=140,
-        )
-
-        submitted = st.form_submit_button(
-            "🚀 Submit Suggestion",
-            type="primary",
-            use_container_width=True,
-        )
-
+        description = st.text_area("Description *", placeholder="What is the idea, what problem does it solve, and what improvement is expected?", height=140)
+        submitted = st.form_submit_button("🚀 Submit Suggestion", type="primary", use_container_width=True)
     if submitted:
-        if not suggested_by or not suggested_by_username:
-            st.error("Please select the registered person who suggested the idea.")
-            return
         if not title.strip():
-            st.error("Please enter a suggestion title.")
-            return
+            st.error("Please enter a suggestion title."); return
         if not description.strip():
-            st.error("Please enter a description.")
-            return
-
+            st.error("Please enter a description."); return
         with st.spinner("Processing and saving your suggestion..."):
             ai_category, ai_note = ai_review(description)
             final_category = category if category else ([ai_category] if ai_category else [])
-
             row = {
-                "legacy_no": None,
-                "submitted_by": suggested_by,
-                "submitted_by_username": suggested_by_username,
-                "entered_by": entered_by,
-                "employee_type": staff_employee_type,
-                "department": staff_department,
-                "date_submitted": date_submitted,
-                "title": title.strip(),
-                "description": description.strip(),
-                "category": ", ".join(final_category),
-                "technique_used": technique_used,
-                "status": "Pending",
-                "tangible_value": 0,
-                "reward": None,
-                "reward_value": 0,
-                "approver": None,
-                "approval_date": None,
-                "date_implemented": None,
-                "ai_note": ai_note,
-                "created_at": datetime.now(),
+                "legacy_no": None, "submitted_by": selected_suggester["display_name"],
+                "submitted_by_username": selected_suggester["username"], "entered_by": entered_by,
+                "entered_by_username": entered_by_username, "employee_type": staff_employee_type,
+                "department": staff_department, "date_submitted": date_submitted, "title": title.strip(),
+                "description": description.strip(), "category": ", ".join(final_category),
+                "technique_used": technique_used, "status": "Pending", "tangible_value": 0,
+                "reward": None, "reward_value": 0, "approver": None, "approval_date": None,
+                "date_implemented": None, "ai_note": ai_note, "created_at": datetime.now(),
             }
-
             try:
                 new_id = insert_suggestion(row)
             except Exception as e:
-                st.error(f"Could not save the suggestion: {e}")
-                return
-
+                st.error(f"Could not save the suggestion: {e}"); return
         st.success(f"Suggestion #{new_id} submitted successfully. Thank you!")
-        st.info(
-            f"Suggested by **{suggested_by}** · Entered by **{entered_by}**. "
-            f"Reference ID: **#{new_id}**."
-        )
+        st.info(f"Suggested by **{selected_suggester['display_name']}** · Entered by **{entered_by}**. Reference ID: **#{new_id}**.")
         if ai_note:
             st.info(f"AI note: {ai_note}")
-
 def page_track_suggestions():
     st.subheader("Suggestion Tracking")
     st.info(
@@ -1749,20 +1700,10 @@ def page_edit_suggestions():
             st.caption(f"Entered by: {entered_by} · Status: {r['status']} · Plant/Site: {r['department']}")
 
             with st.form(f"edit_suggestion_{r['id']}"):
-                accounts = registered_staff_choices()
-                account_labels = [a["label"] for a in accounts]
-                current_sub_username = str(r.get("submitted_by_username") or "")
-                current_name = str(r.get("submitted_by") or "")
-                default_owner_idx = next((i for i, a in enumerate(accounts) if a["username"] == current_sub_username), 0) if accounts else 0
-                if accounts:
-                    selected_owner = st.selectbox("Suggested by *", account_labels, index=default_owner_idx, key=f"edit_owner_{r['id']}")
-                    owner_account = next(a for a in accounts if a["label"] == selected_owner)
-                    suggested_by = owner_account["display_name"]
-                    suggested_by_username = owner_account["username"]
-                else:
-                    st.error("No registered GEMBA / Staff accounts are available.")
-                    suggested_by = current_name
-                    suggested_by_username = current_sub_username
+                suggested_by = st.text_input(
+                    "Suggested by *",
+                    value=str(r.get("submitted_by") or ""),
+                )
                 title = st.text_input(
                     "Suggestion title *",
                     value=str(r.get("title") or ""),
@@ -1797,7 +1738,7 @@ def page_edit_suggestions():
                 description = description.strip()
                 site = site.strip()
 
-                if not suggested_by or not suggested_by_username or not title or not description or not site:
+                if not suggested_by or not title or not description or not site:
                     st.error("Suggested by, title, description and plant/site are required.")
                     continue
                 if len(suggested_by) > 150 or len(site) > 100:
@@ -1809,9 +1750,6 @@ def page_edit_suggestions():
                         int(r["id"]), suggested_by, title, description,
                         edit_date, site, edit_employee_type
                     )
-                    engine = get_engine()
-                    with engine.begin() as conn:
-                        conn.execute(text("UPDATE suggestions SET submitted_by_username=:u WHERE id=:id"), {"u": suggested_by_username, "id": int(r["id"])})
                     st.success(f"Suggestion #{r['id']} updated successfully.")
                     st.rerun()
                 except Exception as exc:
@@ -1953,7 +1891,7 @@ def public_shell():
         staff_shell()
         return
  
-    header("KAIZEN", "GEMBA worker suggestion entry")
+    header("KAIZEN", "GEMBA / Staff registered access")
     qr_expander()
  
     with st.sidebar:
@@ -1980,12 +1918,11 @@ def staff_shell():
     department = st.session_state.get("staff_department", "")
     employee_type = st.session_state.get("staff_employee_type", "")
 
-    username = st.session_state.get("staff_username", "")
-    header("GEMBA / STAFF", f"{name} · {department}")
+    header("GEMBA WORKER", f"{name} · {department}")
 
     with st.sidebar:
         st.markdown(f"### 👷 {name}")
-        st.caption(f"{username} · {employee_type} · {department}")
+        st.caption(f"{employee_type} · {department} · {st.session_state.get('staff_username', '')}")
         if st.button("Change staff / Log out", use_container_width=True):
             logout()
             st.rerun()
@@ -1999,7 +1936,7 @@ def staff_shell():
         st.divider()
         st.info(
             "You can submit Kaizen ideas and view all suggestions and their "
-            "current status for your registered plant/site."
+            "current status for your selected plant/site."
         )
 
     if page == "💡 New Suggestion":
