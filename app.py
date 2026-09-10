@@ -272,6 +272,17 @@ def init_db():
                 active BOOLEAN NOT NULL DEFAULT TRUE
             )
         """
+        # Registered GEMBA / Staff accounts (PostgreSQL).
+        staff_accounts_ddl = """
+            CREATE TABLE IF NOT EXISTS staff_accounts (
+                username VARCHAR(50) PRIMARY KEY,
+                display_name VARCHAR(100) NOT NULL,
+                department VARCHAR(100) NOT NULL,
+                employee_type VARCHAR(50) NOT NULL,
+                password_hash VARCHAR(255) NULL,
+                active BOOLEAN NOT NULL DEFAULT TRUE
+            )
+        """
  
     app_settings_ddl = """
         CREATE TABLE IF NOT EXISTS app_settings (
