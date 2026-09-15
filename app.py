@@ -906,6 +906,15 @@ def verify_staff(username: str, password: str):
     return None
 
 
+def set_staff_password(username: str, new_password: str):
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE staff_accounts SET password_hash=:p WHERE username=:u"),
+            {"p": hash_pw(new_password), "u": username.strip().lower()},
+        )
+
+
 def add_staff_account(username: str, display_name: str, password: str, department: str, employee_type: str) -> bool:
     engine = get_engine()
     try:
@@ -1057,65 +1066,55 @@ def qr_expander():
 # Public (anonymous) pages — Staff / GEMBA
 # --------------------------------------------------------------------------- #
 def staff_access():
-    """Registered GEMBA / Staff sign-in and self-service account creation."""
+    """Registered GEMBA / Staff sign-in. Accounts are created only by an Admin/Approver."""
     st.subheader("👤 GEMBA / Staff Access")
-    st.caption("Use your registered account. Your registered name, HOF / plant site, and employee type are loaded automatically.")
-    sign_in_tab, create_tab = st.tabs(["🔐 Sign In", "🆕 Create Registered Account"])
-    with sign_in_tab:
-        accounts = registered_staff_choices()
-        if not accounts:
-            st.info("No GEMBA / Staff accounts have been registered yet. Create your account in the **Create Registered Account** tab.")
-        else:
-            labels = [a["label"] for a in accounts]
-            selected_label = st.selectbox("Registered account *", labels, key="staff_login_account")
-            selected = next(a for a in accounts if a["label"] == selected_label)
-            with st.form("staff_signin_form"):
-                password = st.text_input("Password *", type="password")
-                sign_in = st.form_submit_button("🔐 Sign in", type="primary", use_container_width=True)
-            if sign_in:
-                user = verify_staff(selected["username"], password)
-                if not user:
-                    st.error("Incorrect password or inactive account.")
-                else:
-                    st.session_state["role"] = "staff"
-                    st.session_state["staff_username"] = user["username"]
-                    st.session_state["staff_name"] = user["display_name"]
-                    st.session_state["staff_department"] = user["department"]
-                    st.session_state["staff_employee_type"] = user["employee_type"]
-                    st.session_state["staff_access_granted"] = True
-                    st.rerun()
-    with create_tab:
-        st.info("Create your own registered account. Your username must be unique, but different people may have the same name.")
-        plant_options = DEPARTMENTS + ["➕ Add New Plant"]
-        with st.form("create_staff_account_form", clear_on_submit=True):
-            display_name = st.text_input("Registered name *", placeholder="e.g. Roshan")
-            username = st.text_input("Unique username *", placeholder="e.g. roshan01", help="This identifies your account and must be unique.")
-            password1 = st.text_input("Password *", type="password")
-            password2 = st.text_input("Confirm password *", type="password")
-            selected_site = st.selectbox("HOF / Plant Site *", plant_options)
-            new_plant = ""
-            if selected_site == "➕ Add New Plant":
-                new_plant = st.text_input("New Plant / Site Name *", placeholder="e.g. ABC Hydro Power Plant")
-            employee_type = st.radio("Employee type *", ["GEMBA Worker", "Staff"], horizontal=True)
-            create_clicked = st.form_submit_button("🆕 Create Registered Account", type="primary", use_container_width=True)
-        if create_clicked:
-            display_name = display_name.strip(); username = username.strip().lower()
-            department = (new_plant if selected_site == "➕ Add New Plant" else selected_site).strip()
-            if not display_name or not username or not password1 or not password2 or not department:
-                st.error("Please complete all required fields.")
-            elif not re.fullmatch(r"[a-z0-9._-]{3,80}", username):
-                st.error("Username must be 3–80 characters and use only lowercase letters, numbers, dot, underscore or hyphen.")
-            elif len(password1) < 6:
-                st.error("Password must be at least 6 characters.")
-            elif password1 != password2:
-                st.error("Passwords do not match.")
-            elif len(display_name) > 150 or len(department) > 100:
-                st.error("Name or plant/site is too long.")
-            elif add_staff_account(username, display_name, password1, department, employee_type):
-                st.success(f"Registered account created for {display_name}. You can now sign in using **{username}**.")
-            else:
-                st.error("That username is already registered. Please choose another username.")
+    st.caption(
+        "Sign in with the username and password provided by your Admin. "
+        "Your registered name, HOF / plant site, and employee type are loaded automatically."
+    )
+
+    with st.form("staff_signin_form"):
+        username = st.text_input(
+            "Username *",
+            placeholder="Enter your registered username",
+            autocomplete="username",
+        ).strip().lower()
+        password = st.text_input(
+            "Password *",
+            type="password",
+            placeholder="Enter your password",
+            autocomplete="current-password",
+        )
+        sign_in = st.form_submit_button(
+            "🔐 Sign in", type="primary", use_container_width=True
+        )
+
+    if sign_in:
+        if not username or not password:
+            st.error("Please enter both your username and password.")
+            return
+
+        user = verify_staff(username, password)
+        if not user:
+            st.error("Incorrect username/password or inactive account.")
+            return
+
+        st.session_state["role"] = "staff"
+        st.session_state["staff_username"] = user["username"]
+        st.session_state["staff_name"] = user["display_name"]
+        st.session_state["staff_department"] = user["department"]
+        st.session_state["staff_employee_type"] = user["employee_type"]
+        st.session_state["staff_access_granted"] = True
+        st.rerun()
+
+    st.info(
+        "🔒 Registered accounts are created by an Admin/Approver only. "
+        "If you do not have an account, please contact your Admin."
+    )
+
     return False
+
+
 def page_site_implemented():
     """Show all Kaizen suggestions recorded for the currently selected plant/site."""
     site = (st.session_state.get("staff_department") or "").strip()
@@ -1230,12 +1229,27 @@ def page_log_suggestion():
     if not accounts:
         st.error("No active registered GEMBA / Staff accounts are available.")
         return
-    labels = [a["label"] for a in accounts]
-    current_label = next((a["label"] for a in accounts if a["username"] == entered_by_username), labels[0])
+
+    # The username is the unique identifier. The select box is searchable, so a
+    # user can type a username and immediately see/select the matching full name.
+    account_by_username = {a["username"]: a for a in accounts}
+    usernames = list(account_by_username.keys())
+    default_username = entered_by_username if entered_by_username in account_by_username else usernames[0]
+    default_index = usernames.index(default_username)
+
     with st.form("log_suggestion_form", clear_on_submit=True):
-        suggested_label = st.selectbox("Suggested by *", labels, index=labels.index(current_label), help="Select the registered person who actually suggested the idea. Unregistered names cannot be entered.")
-        selected_suggester = next(a for a in accounts if a["label"] == suggested_label)
-        st.caption(f"Registered name: **{selected_suggester['display_name']}** · Username: **{selected_suggester['username']}**")
+        selected_username = st.selectbox(
+            "Employee Username *",
+            usernames,
+            index=default_index,
+            format_func=lambda u: f"{account_by_username[u]['display_name']} — {u}",
+            help="Type/search the unique username. The registered full name (First Name + Last Name) is shown automatically.",
+        )
+        selected_suggester = account_by_username[selected_username]
+        st.success(
+            f"👤 Suggested by: **{selected_suggester['display_name']}**  ·  "
+            f"Username: **{selected_suggester['username']}**"
+        )
         c1, c2 = st.columns(2)
         with c1:
             title = st.text_input("Suggestion title *", placeholder="Short summary of the idea")
@@ -1826,6 +1840,127 @@ def page_import_excel():
                 st.error(f"Import failed: {exc}")
 
 
+def page_manage_staff_accounts():
+    """Admin-only management of GEMBA / Staff registered accounts."""
+    if st.session_state.get("role") != "approver":
+        st.error("Admin/Approver access is required.")
+        return
+
+    st.subheader("👥 Manage GEMBA / Staff Accounts")
+    st.caption(
+        "Only Admin/Approver users can create and manage registered Staff / GEMBA accounts. "
+        "Staff members cannot create their own accounts."
+    )
+
+    st.markdown("**Current registered accounts**")
+    accounts = df_staff_accounts()
+
+    if accounts.empty:
+        st.info("No Staff / GEMBA accounts have been created yet.")
+    else:
+        for _, a in accounts.iterrows():
+            c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
+            c1.write(f"**{a['display_name']}**")
+            c2.caption(f"Username: {a['username']}")
+            c3.write(
+                f"🟢 Active · {a['department']}"
+                if bool(a["active"])
+                else f"⚪ Inactive · {a['department']}"
+            )
+            toggle_label = "Deactivate" if bool(a["active"]) else "Reactivate"
+            if c4.button(toggle_label, key=f"staff_toggle_{a['username']}"):
+                set_staff_active(a["username"], not bool(a["active"]))
+                st.rerun()
+
+    st.divider()
+    st.markdown("**Create a registered Staff / GEMBA account**")
+    st.caption(
+        "The Admin creates the username and initial password. The Staff/GEMBA user "
+        "can change the password later from **My Account**."
+    )
+
+    plant_options = DEPARTMENTS + ["➕ Add New Plant"]
+    with st.form("admin_create_staff_account_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            first_name = st.text_input(
+                "First Name *",
+                placeholder="e.g. Samoda",
+            )
+            last_name = st.text_input(
+                "Last Name *",
+                placeholder="e.g. De Silva",
+            )
+            username = st.text_input(
+                "Username *",
+                placeholder="e.g. samoda01",
+                help="Must be unique. Use lowercase letters, numbers, dot, underscore or hyphen.",
+            )
+            password1 = st.text_input(
+                "Initial Password *",
+                type="password",
+                placeholder="Set an initial password",
+            )
+        with c2:
+            password2 = st.text_input(
+                "Confirm Initial Password *",
+                type="password",
+                placeholder="Re-enter the initial password",
+            )
+            selected_site = st.selectbox("HOF / Plant Site *", plant_options)
+            employee_type = st.radio(
+                "Employee Type *",
+                ["GEMBA Worker", "Staff"],
+                horizontal=True,
+            )
+
+        new_plant = ""
+        if selected_site == "➕ Add New Plant":
+            new_plant = st.text_input(
+                "New Plant / Site Name *",
+                placeholder="e.g. ABC Hydro Power Plant",
+            )
+
+        create_clicked = st.form_submit_button(
+            "➕ Create Registered Account",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if create_clicked:
+        first_name = first_name.strip()
+        last_name = last_name.strip()
+        display_name = f"{first_name} {last_name}".strip()
+        username = username.strip().lower()
+        department = (
+            new_plant if selected_site == "➕ Add New Plant" else selected_site
+        ).strip()
+
+        if not first_name or not last_name or not username or not password1 or not password2 or not department:
+            st.error("Please complete First Name, Last Name, Username, password and plant/site.")
+        elif not re.fullmatch(r"[a-z0-9._-]{3,80}", username):
+            st.error(
+                "Username must be 3–80 characters and use only lowercase letters, "
+                "numbers, dot, underscore or hyphen."
+            )
+        elif len(password1) < 6:
+            st.error("Initial password must be at least 6 characters.")
+        elif password1 != password2:
+            st.error("Passwords do not match.")
+        elif len(first_name) > 75 or len(last_name) > 75 or len(department) > 100:
+            st.error("First name, last name or plant/site is too long.")
+        elif get_staff_account(username):
+            st.error("That username is already registered. Please choose another username.")
+        elif add_staff_account(username, display_name, password1, department, employee_type):
+            st.success(
+                f"Registered account created for **{display_name}**. "
+                f"They can now sign in with username **{username}**."
+            )
+            st.rerun()
+        else:
+            st.error("Could not create the account. The username may already exist.")
+
+
 def page_manage_approvers():
     st.subheader("Manage Approvers")
  
@@ -1922,30 +2057,71 @@ def staff_shell():
 
     with st.sidebar:
         st.markdown(f"### 👷 {name}")
-        st.caption(f"{employee_type} · {department} · {st.session_state.get('staff_username', '')}")
-        if st.button("Change staff / Log out", use_container_width=True):
+        st.caption(
+            f"{employee_type} · {department} · "
+            f"{st.session_state.get('staff_username', '')}"
+        )
+        if st.button("🚪 Log out", use_container_width=True):
             logout()
             st.rerun()
         st.divider()
         st.markdown("### GEMBA Workspace")
         page = st.radio(
             "Navigation",
-            ["💡 New Suggestion", "📋 Suggestions at My Site"],
+            ["💡 New Suggestion", "📋 Suggestions at My Site", "🔑 My Account"],
             label_visibility="collapsed",
         )
         st.divider()
         st.info(
-            "You can submit Kaizen ideas and view all suggestions and their "
-            "current status for your selected plant/site."
+            "You can submit Kaizen ideas, view suggestions and their current status "
+            "for your selected plant/site, and change your own password."
         )
 
     if page == "💡 New Suggestion":
         page_log_suggestion()
-    else:
+    elif page == "📋 Suggestions at My Site":
         page_site_implemented()
+    else:
+        page_staff_account()
 
- 
- 
+
+def page_staff_account():
+    """Allow a signed-in Staff/GEMBA user to change their own password."""
+    username = st.session_state.get("staff_username")
+    if not username:
+        st.warning("Please sign in first.")
+        return
+
+    st.subheader("🔑 My Account")
+    st.caption(f"Username: **{username}**")
+    st.info(
+        "You can change your password here. Your Admin controls your registered "
+        "name, employee type and HOF / Plant Site."
+    )
+
+    with st.form("staff_change_password_form", clear_on_submit=True):
+        current_pw = st.text_input("Current password *", type="password")
+        new_pw1 = st.text_input("New password *", type="password")
+        new_pw2 = st.text_input("Confirm new password *", type="password")
+        change_clicked = st.form_submit_button(
+            "🔄 Change Password", type="primary", use_container_width=True
+        )
+
+    if change_clicked:
+        me = verify_staff(username, current_pw)
+        if not me:
+            st.error("Current password is incorrect.")
+        elif not new_pw1 or new_pw1 != new_pw2:
+            st.error("New passwords must match and cannot be empty.")
+        elif len(new_pw1) < 6:
+            st.error("New password must be at least 6 characters.")
+        elif new_pw1 == current_pw:
+            st.error("New password must be different from your current password.")
+        else:
+            set_staff_password(username, new_pw1)
+            st.success("Password changed successfully. Use the new password next time you sign in.")
+
+
 def approver_shell():
     who = st.session_state["approver_display_name"]
     df = df_suggestions()
@@ -1971,7 +2147,8 @@ def approver_shell():
         st.divider()
         page = st.radio("Navigation", [
             "📊 Dashboard", "📝 Pending Approvals", "🟢 Approved", "🔴 Rejected",
-            "🔵 Implemented", "📋 All Suggestions", "✏️ Edit Suggestions", "📥 Import Excel", "⚙️ Manage Approvers"
+            "🔵 Implemented", "📋 All Suggestions", "✏️ Edit Suggestions", "📥 Import Excel",
+             "👥 Manage Staff Accounts", "⚙️ Manage Approvers"
         ], label_visibility="collapsed")
  
     if page == "📊 Dashboard":
@@ -1984,6 +2161,8 @@ def approver_shell():
         page_edit_suggestions()
     elif page == "📥 Import Excel":
         page_import_excel()
+    elif page == "👥 Manage Staff Accounts":
+        page_manage_staff_accounts()
     elif page == "⚙️ Manage Approvers":
         page_manage_approvers()
     else:
