@@ -1297,15 +1297,15 @@ def page_track_suggestions():
 # Approver — sign in (with self-service first-time password setup)
 # --------------------------------------------------------------------------- #
 def approver_signin():
-    st.subheader("🔐 Approver Sign In")
+    st.subheader("🔐 Admin Sign In")
     st.caption(
-        "Enter your approved username. On your first sign-in, you will create "
+        "Enter your approved admin username. On your first sign-in, you will create "
         "your own preferred password."
     )
  
     username = st.text_input(
-        "Approver username *",
-        placeholder="e.g. roshan",
+        "Admin username *",
+        placeholder="e.g. admin username",
         key="approver_login_username",
     ).strip().lower()
  
@@ -1321,7 +1321,7 @@ def approver_signin():
  
     with st.form("approver_signin_form"):
         password = st.text_input(
-            "Your preferred password",
+            "Your admin password",
             type="password",
             placeholder="Enter the password you created",
         )
@@ -1335,7 +1335,7 @@ def approver_signin():
         return
  
     if not username:
-        st.error("Please enter your approver username.")
+        st.error("Please enter your admin username.")
         return
  
     with st.spinner("Processing sign-in..."):
@@ -1467,7 +1467,17 @@ def page_dashboard():
     c5.metric("Implemented", implemented)
     c6.metric("Approved + Implemented", approved_total)
     c7.metric("Implementation rate", f"{impl_rate:.0f}%")
-    c8.metric("Tangible value", f"Rs {tangible_total:,.0f}")
+    # Tangible value gets its own compact value display so the full amount is visible.
+    with c8:
+        st.markdown(
+            f"""
+            <div style="background:#fff;border:1px solid #e4ece8;padding:14px 16px;border-radius:14px;box-shadow:0 4px 16px rgba(31,52,43,0.04);min-height:58px;">
+                <div style="font-size:21px;line-height:1.2;font-weight:400;color:#1e2e39;white-space:nowrap;">Rs {tangible_total:,.0f}</div>
+                <div style="font-size:12px;line-height:1.2;color:#1e2e39;margin-top:6px;">Tangible value</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     st.divider()
 
@@ -2018,7 +2028,7 @@ def page_manage_approvers():
 def public_shell():
     # This screen is the entry point. It deliberately exposes no suggestion data.
     if st.session_state.get("pending_first_time_username"):
-        header("APPROVER", "First-time password setup")
+        header("ADMIN", "First-time password setup")
         first_time_password_setup()
         return
  
@@ -2033,7 +2043,7 @@ def public_shell():
         st.markdown("### Access")
         page = st.radio(
             "Choose access",
-            ["GEMBA / Staff Access", "Approver Sign In"],
+            ["GEMBA / Staff Access", "Admin Sign In"],
             label_visibility="collapsed",
         )
         st.divider()
