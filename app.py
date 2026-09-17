@@ -1422,7 +1422,7 @@ def kpi_card(label, value, col):
  
  
 def page_dashboard():
-    st.subheader("📊 Approver Dashboard")
+    st.subheader("📊 Admin Dashboard")
     st.caption("Management view of suggestions with plant/site-level performance.")
 
     df = df_suggestions()
@@ -1471,7 +1471,8 @@ def page_dashboard():
     with c8:
         st.markdown(
             f"""
-            <div style="background:#fff;border:1px solid #e4ece8;padding:14px 16px;border-radius:14px;box-shadow:0 4px 16px rgba(31,52,43,0.04);min-height:58px;">
+            <div style="background:#fff;border:1px solid #e4ece8;padding:14px 16px;border-radius:14px;box-shadow:0 4px 16px rgba(31,52,43,0.04);>
+
                 <div style="font-size:12px;line-height:1.2;color:#1e2e39;margin-bottom:6px;">Tangible value</div>
                 <div style="font-size:21px;line-height:1.2;font-weight:400;color:#1e2e39;white-space:nowrap;">Rs {tangible_total:,.0f}</div>
             </div>
