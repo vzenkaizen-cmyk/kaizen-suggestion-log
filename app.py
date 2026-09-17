@@ -1470,13 +1470,7 @@ def page_dashboard():
     # Tangible value gets its own compact value display so the full amount is visible.
     with c8:
         st.markdown(
-            f"""
-            <div style="background:#fff;border:1px solid #e4ece8;padding:14px 16px;border-radius:14px;box-shadow:0 4px 16px rgba(31,52,43,0.04);">
-
-                <div style="font-size:12px;line-height:1.2;color:#1e2e39;margin-bottom:6px;">Tangible value</div>
-                <div style="font-size:21px;line-height:1.2;font-weight:400;color:#1e2e39;white-space:nowrap;">Rs {tangible_total:,.0f}</div>
-            </div>
-            """,
+            f"""<div style="background:#fff;border:1px solid #e4ece8;padding:14px 16px;border-radius:14px;box-shadow:0 4px 16px rgba(31,52,43,0.04);"><div style="font-size:12px;line-height:1.2;color:#1e2e39;margin-bottom:6px;">Tangible value</div><div style="font-size:21px;line-height:1.2;font-weight:400;color:#1e2e39;white-space:nowrap;">Rs {tangible_total:,.0f}</div></div>""",
             unsafe_allow_html=True,
         )
 
