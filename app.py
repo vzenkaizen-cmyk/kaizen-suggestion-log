@@ -1472,8 +1472,8 @@ def page_dashboard():
         st.markdown(
             f"""
             <div style="background:#fff;border:1px solid #e4ece8;padding:14px 16px;border-radius:14px;box-shadow:0 4px 16px rgba(31,52,43,0.04);min-height:58px;">
+                <div style="font-size:12px;line-height:1.2;color:#1e2e39;margin-bottom:6px;">Tangible value</div>
                 <div style="font-size:21px;line-height:1.2;font-weight:400;color:#1e2e39;white-space:nowrap;">Rs {tangible_total:,.0f}</div>
-                <div style="font-size:12px;line-height:1.2;color:#1e2e39;margin-top:6px;">Tangible value</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1853,12 +1853,12 @@ def page_import_excel():
 def page_manage_staff_accounts():
     """Admin-only management of GEMBA / Staff registered accounts."""
     if st.session_state.get("role") != "approver":
-        st.error("Admin/Approver access is required.")
+        st.error("Admin access is required.")
         return
 
     st.subheader("👥 Manage GEMBA / Staff Accounts")
     st.caption(
-        "Only Admin/Approver users can create and manage registered Staff / GEMBA accounts. "
+        "Only Admin users can create and manage registered Staff / GEMBA accounts. "
         "Staff members cannot create their own accounts."
     )
 
