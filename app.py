@@ -353,6 +353,7 @@ def ensure_optional_columns():
         "reward_value": "DECIMAL(14,2)",
         "submitted_by_username": "VARCHAR(80)",
         "entered_by_username": "VARCHAR(80)",
+        "developed_by": "VARCHAR(150)",
     }
     existing={c["name"] for c in sa.inspect(engine).get_columns("suggestions")}
     with engine.begin() as conn:
@@ -812,18 +813,23 @@ def update_suggestion_details(sug_id, suggested_by, title, description, date_sub
         )
 
 
-def update_suggestion_decision(sug_id, status, approver, tangible_value, reward, technique_used):
+def update_suggestion_decision(sug_id, status, approver, tangible_value, reward, technique_used, developed_by=None):
     engine = get_engine()
     with engine.begin() as conn:
         conn.execute(
             text("""UPDATE suggestions
                     SET status=:status, approver=:approver, approval_date=:approval_date,
-                        tangible_value=:tangible_value, reward=:reward, technique_used=:technique_used
+                        tangible_value=:tangible_value, reward=:reward, technique_used=:technique_used,
+                        developed_by=:developed_by,
+                        date_implemented=:date_implemented
                     WHERE id=:id"""),
             {
                 "status": status, "approver": approver,
                 "approval_date": datetime.now(), "tangible_value": tangible_value,
-                "reward": reward, "technique_used": technique_used, "id": sug_id,
+                "reward": reward, "technique_used": technique_used,
+                "developed_by": developed_by,
+                "date_implemented": date.today() if status == "Implemented" else None,
+                "id": sug_id,
             },
         )
  
@@ -1095,17 +1101,26 @@ def staff_access():
             return
 
         user = verify_staff(username, password)
-        if not user:
-            st.error("Incorrect username/password or inactive account.")
-            return
+        if user:
+            st.session_state["role"] = "staff"
+            st.session_state["staff_username"] = user["username"]
+            st.session_state["staff_name"] = user["display_name"]
+            st.session_state["staff_department"] = user["department"]
+            st.session_state["staff_employee_type"] = user["employee_type"]
+            st.session_state["staff_access_granted"] = True
+            st.rerun()
 
-        st.session_state["role"] = "staff"
-        st.session_state["staff_username"] = user["username"]
-        st.session_state["staff_name"] = user["display_name"]
-        st.session_state["staff_department"] = user["department"]
-        st.session_state["staff_employee_type"] = user["employee_type"]
-        st.session_state["staff_access_granted"] = True
-        st.rerun()
+        # Admins can also use the GEMBA / Staff access screen. They do not need
+        # a separate Staff account just to enter a suggestion.
+        admin_user = verify_approver(username, password)
+        if admin_user:
+            st.session_state["role"] = "approver"
+            st.session_state["approver_username"] = admin_user["username"]
+            st.session_state["approver_display_name"] = admin_user["display_name"]
+            st.session_state["admin_submit_mode"] = True
+            st.rerun()
+
+        st.error("Incorrect username/password or inactive account.")
 
     st.info(
         "🔒 Registered accounts are created by an Admin/Approver only. "
@@ -1206,6 +1221,8 @@ def page_site_implemented():
                 st.success(
                     f"✅ Implemented on: {r['date_implemented'] or 'Date not recorded'}"
                 )
+                if r.get("developed_by"):
+                    st.caption(f"🛠️ Developed by: {r['developed_by']}")
 
             if r["reward"]:
                 st.info(f"🏆 Recognition / Reward: {r['reward']}")
@@ -1213,28 +1230,53 @@ def page_site_implemented():
  
  
 def page_log_suggestion():
-    """Create a suggestion while keeping the recorder and suggestion owner separate."""
+    """Create a suggestion while keeping the recorder and suggestion owner separate.
+
+    Staff/GEMBA users use their registered site. Admin users can submit on behalf
+    of any participant and choose any HOF / plant site, so no separate Admin Staff
+    account is required.
+    """
     st.subheader("💡 New Kaizen Suggestion")
-    entered_by = st.session_state.get("staff_name")
-    entered_by_username = st.session_state.get("staff_username")
-    staff_department = st.session_state.get("staff_department")
-    staff_employee_type = st.session_state.get("staff_employee_type")
-    if not entered_by or not entered_by_username or not staff_department or not staff_employee_type:
-        st.warning("Please sign in with your registered GEMBA / Staff account before logging a suggestion.")
-        return
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Entered by", entered_by); c2.metric("Department", staff_department); c3.metric("Employee Type", staff_employee_type)
-    st.caption("The person entering the record may be different from the person who actually suggested the idea.")
+    is_admin = st.session_state.get("role") == "approver"
+
+    if is_admin:
+        entered_by = st.session_state.get("approver_display_name", "Admin")
+        entered_by_username = st.session_state.get("approver_username")
+        staff_department = None
+        staff_employee_type = None
+    else:
+        entered_by = st.session_state.get("staff_name")
+        entered_by_username = st.session_state.get("staff_username")
+        staff_department = st.session_state.get("staff_department")
+        staff_employee_type = st.session_state.get("staff_employee_type")
+        if not entered_by or not entered_by_username or not staff_department or not staff_employee_type:
+            st.warning("Please sign in with your registered GEMBA / Staff account before logging a suggestion.")
+            return
+
     accounts = registered_staff_choices()
     if not accounts:
         st.error("No active registered GEMBA / Staff accounts are available.")
         return
 
-    # The username is the unique identifier. The select box is searchable, so a
-    # user can type a username and immediately see/select the matching full name.
     account_by_username = {a["username"]: a for a in accounts}
     usernames = list(account_by_username.keys())
-    default_username = entered_by_username if entered_by_username in account_by_username else usernames[0]
+
+    if is_admin:
+        st.info("🔐 Admin entry mode: you can submit a suggestion for any participant and select any HOF / plant site. No separate Staff account is required for you.")
+        c1, c2 = st.columns(2)
+        with c1:
+            entered_display = st.text_input("Entered by", value=entered_by, disabled=True)
+        with c2:
+            site_options = list(dict.fromkeys(DEPARTMENTS + [a["department"] for a in accounts if a["department"]]))
+            selected_site = st.selectbox("HOF / Plant Site *", site_options, key="admin_entry_site")
+        st.caption("The person entering the record may be different from the person who actually suggested the idea.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Entered by", entered_by); c2.metric("Department", staff_department); c3.metric("Employee Type", staff_employee_type)
+        st.caption("The person entering the record may be different from the person who actually suggested the idea.")
+        selected_site = staff_department
+
+    default_username = entered_by_username if (not is_admin and entered_by_username in account_by_username) else usernames[0]
     default_index = usernames.index(default_username)
 
     with st.form("log_suggestion_form", clear_on_submit=True):
@@ -1250,6 +1292,11 @@ def page_log_suggestion():
             f"👤 Suggested by: **{selected_suggester['display_name']}**  ·  "
             f"Username: **{selected_suggester['username']}**"
         )
+
+        if is_admin:
+            # The site selected by Admin is outside the form so it can be changed freely.
+            pass
+
         c1, c2 = st.columns(2)
         with c1:
             title = st.text_input("Suggestion title *", placeholder="Short summary of the idea")
@@ -1259,32 +1306,39 @@ def page_log_suggestion():
             category = st.multiselect("Category (PQCDSM)", CATEGORIES)
         description = st.text_area("Description *", placeholder="What is the idea, what problem does it solve, and what improvement is expected?", height=140)
         submitted = st.form_submit_button("🚀 Submit Suggestion", type="primary", use_container_width=True)
+
     if submitted:
         if not title.strip():
             st.error("Please enter a suggestion title."); return
         if not description.strip():
             st.error("Please enter a description."); return
+
+        # For Admin submissions, employee type follows the selected participant.
+        final_employee_type = selected_suggester["employee_type"] if is_admin else staff_employee_type
+        final_department = selected_site if is_admin else staff_department
+
         with st.spinner("Processing and saving your suggestion..."):
             ai_category, ai_note = ai_review(description)
             final_category = category if category else ([ai_category] if ai_category else [])
             row = {
                 "legacy_no": None, "submitted_by": selected_suggester["display_name"],
                 "submitted_by_username": selected_suggester["username"], "entered_by": entered_by,
-                "entered_by_username": entered_by_username, "employee_type": staff_employee_type,
-                "department": staff_department, "date_submitted": date_submitted, "title": title.strip(),
+                "entered_by_username": entered_by_username, "employee_type": final_employee_type,
+                "department": final_department, "date_submitted": date_submitted, "title": title.strip(),
                 "description": description.strip(), "category": ", ".join(final_category),
                 "technique_used": technique_used, "status": "Pending", "tangible_value": 0,
                 "reward": None, "reward_value": 0, "approver": None, "approval_date": None,
-                "date_implemented": None, "ai_note": ai_note, "created_at": datetime.now(),
+                "date_implemented": None, "developed_by": None, "ai_note": ai_note, "created_at": datetime.now(),
             }
             try:
                 new_id = insert_suggestion(row)
             except Exception as e:
                 st.error(f"Could not save the suggestion: {e}"); return
         st.success(f"Suggestion #{new_id} submitted successfully. Thank you!")
-        st.info(f"Suggested by **{selected_suggester['display_name']}** · Entered by **{entered_by}**. Reference ID: **#{new_id}**.")
+        st.info(f"Suggested by **{selected_suggester['display_name']}** · Entered by **{entered_by}** · Site **{final_department}**. Reference ID: **#{new_id}**.")
         if ai_note:
             st.info(f"AI note: {ai_note}")
+
 def page_track_suggestions():
     st.subheader("Suggestion Tracking")
     st.info(
@@ -1422,7 +1476,7 @@ def kpi_card(label, value, col):
  
  
 def page_dashboard():
-    st.subheader("📊 Admin Dashboard")
+    st.subheader("📊 Approver Dashboard")
     st.caption("Management view of suggestions with plant/site-level performance.")
 
     df = df_suggestions()
@@ -1470,7 +1524,12 @@ def page_dashboard():
     # Tangible value gets its own compact value display so the full amount is visible.
     with c8:
         st.markdown(
-            f"""<div style="background:#fff;border:1px solid #e4ece8;padding:14px 16px;border-radius:14px;box-shadow:0 4px 16px rgba(31,52,43,0.04);"><div style="font-size:12px;line-height:1.2;color:#1e2e39;margin-bottom:6px;">Tangible value</div><div style="font-size:21px;line-height:1.2;font-weight:400;color:#1e2e39;white-space:nowrap;">Rs {tangible_total:,.0f}</div></div>""",
+            f"""
+            <div style="background:#fff;border:1px solid #e4ece8;padding:14px 16px;border-radius:14px;box-shadow:0 4px 16px rgba(31,52,43,0.04);min-height:58px;">
+                <div style="font-size:21px;line-height:1.2;font-weight:400;color:#1e2e39;white-space:nowrap;">Rs {tangible_total:,.0f}</div>
+                <div style="font-size:12px;line-height:1.2;color:#1e2e39;margin-top:6px;">Tangible value</div>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
 
@@ -1504,6 +1563,47 @@ def page_dashboard():
             st.dataframe(summary_df, use_container_width=True, hide_index=True)
         else:
             st.info("No plant/site information is available yet.")
+
+    # Participant selector: show the implemented suggestions belonging to the selected participant.
+    st.divider()
+    st.markdown("### 👤 Participant-wise Implemented Suggestions")
+    participant_source = site_df[site_df["status"] == "Implemented"].copy()
+    participant_names = sorted(
+        [str(x).strip() for x in participant_source["submitted_by"].dropna().unique() if str(x).strip()],
+        key=str.casefold,
+    )
+    if participant_names:
+        selected_participant = st.selectbox(
+            "👤 Select Participant",
+            ["Select a participant"] + participant_names,
+            key="dashboard_participant_filter",
+        )
+        if selected_participant != "Select a participant":
+            participant_view = participant_source[
+                participant_source["submitted_by"].fillna("").astype(str).str.strip().str.casefold()
+                == selected_participant.casefold()
+            ].copy()
+            st.caption(f"Showing **{len(participant_view)}** implemented suggestion(s) for **{selected_participant}**.")
+            participant_show = participant_view[[
+                "id", "date_submitted", "title", "department", "category",
+                "technique_used", "date_implemented", "developed_by", "tangible_value"
+            ]].rename(columns={
+                "id": "ID", "date_submitted": "Submitted Date", "title": "Suggestion",
+                "department": "HOF / Plant Site", "category": "Category",
+                "technique_used": "Technique", "date_implemented": "Date Implemented",
+                "developed_by": "Developed By", "tangible_value": "Tangible Value (LKR)",
+            }).sort_values("Date Implemented", ascending=False, na_position="last")
+            participant_show["Tangible Value (LKR)"] = pd.to_numeric(
+                participant_show["Tangible Value (LKR)"], errors="coerce"
+            ).fillna(0)
+            st.dataframe(
+                participant_show, use_container_width=True, hide_index=True,
+                column_config=kaizen_table_column_config(),
+            )
+        else:
+            st.info("Select a participant to display all of their implemented suggestions.")
+    else:
+        st.info("No implemented suggestions are available for the selected plant/site.")
 
     left, right = st.columns(2)
     with left:
@@ -1564,6 +1664,12 @@ def page_approvals():
                                           if r["technique_used"] in TECHNIQUES else 0,
                                           key=f"tech_{r['id']}")
                 mark_implemented = st.checkbox("Mark as already implemented", key=f"impl_{r['id']}")
+                developed_by = st.text_input(
+                    "Developed by",
+                    placeholder="Enter the person who developed/implemented the idea",
+                    help="The developer can be different from the person who suggested the idea.",
+                    key=f"developed_by_{r['id']}",
+                ) if mark_implemented else ""
                 tangible_value = st.number_input("Tangible value (LKR)", min_value=0.0, step=1000.0,
                                                   key=f"val_{r['id']}")
                 reward = st.text_input("Reward / recognition (optional)", key=f"reward_{r['id']}")
@@ -1574,9 +1680,12 @@ def page_approvals():
  
             if approve_clicked:
                 status = "Implemented" if mark_implemented else "Approved"
+                if mark_implemented and not developed_by.strip():
+                    st.error("Please enter who developed/implemented the suggestion.")
+                    continue
                 update_suggestion_decision(
                     r["id"], status, st.session_state["approver_display_name"],
-                    tangible_value, reward or None, technique,
+                    tangible_value, reward or None, technique, developed_by.strip() or None,
                 )
                 st.success(f"Suggestion #{r['id']} marked {status}.")
                 st.rerun()
@@ -1625,6 +1734,7 @@ def kaizen_table_column_config():
         "Decided By": st.column_config.TextColumn("Decided By", width="medium"),
         "Decision Date": st.column_config.DatetimeColumn("Decision Date", width="medium", format="DD/MM/YYYY HH:mm"),
         "Date Implemented": st.column_config.DateColumn("Date Implemented", width="medium", format="DD/MM/YYYY"),
+        "Developed By": st.column_config.TextColumn("Developed By", width="large"),
     }
 
 
@@ -1666,13 +1776,13 @@ def page_all_suggestions():
 
     show = view[["id", "legacy_no", "date_submitted", "submitted_by", "entered_by", "employee_type", "department", "title",
                  "category", "technique_used", "status", "tangible_value", "reward", "reward_value",
-                 "approver", "approval_date", "date_implemented"]].rename(columns={
+                 "approver", "approval_date", "date_implemented", "developed_by"]].rename(columns={
         "id": "Database ID", "legacy_no": "Excel No.", "date_submitted": "Submitted Date", "submitted_by": "Submitted By",
         "entered_by": "Entered By", "employee_type": "Employee Type", "department": "HOF / Plant Site", "title": "Suggestion",
         "category": "Category", "technique_used": "Technique", "status": "Status",
         "tangible_value": "Tangible Value (LKR)", "reward": "Reward / Recognition",
         "reward_value": "Reward Value (LKR)", "approver": "Decided By",
-        "approval_date": "Decision Date", "date_implemented": "Date Implemented",
+        "approval_date": "Decision Date", "date_implemented": "Date Implemented", "developed_by": "Developed By",
     })
     show["Tangible Value (LKR)"] = pd.to_numeric(show["Tangible Value (LKR)"], errors="coerce").fillna(0)
     show["Reward Value (LKR)"] = pd.to_numeric(show["Reward Value (LKR)"], errors="coerce").fillna(0)
@@ -1848,12 +1958,12 @@ def page_import_excel():
 def page_manage_staff_accounts():
     """Admin-only management of GEMBA / Staff registered accounts."""
     if st.session_state.get("role") != "approver":
-        st.error("Admin access is required.")
+        st.error("Admin/Approver access is required.")
         return
 
     st.subheader("👥 Manage GEMBA / Staff Accounts")
     st.caption(
-        "Only Admin users can create and manage registered Staff / GEMBA accounts. "
+        "Only Admin/Approver users can create and manage registered Staff / GEMBA accounts. "
         "Staff members cannot create their own accounts."
     )
 
@@ -2134,7 +2244,7 @@ def approver_shell():
  
     header("APPROVER", f"Signed in as {who}")
     with st.sidebar:
-        st.markdown("### 🔐 Approver Workspace")
+        st.markdown("### 🔐 Admin Workspace")
         st.caption(f"Signed in as **{who}**")
         if st.button("🚪 Sign out", use_container_width=True):
             logout()
@@ -2151,13 +2261,15 @@ def approver_shell():
         st.markdown(f"🔵 Implemented  **{counts['Implemented']}**")
         st.divider()
         page = st.radio("Navigation", [
-            "📊 Dashboard", "📝 Pending Approvals", "🟢 Approved", "🔴 Rejected",
+            "📊 Dashboard", "💡 New Suggestion", "📝 Pending Approvals", "🟢 Approved", "🔴 Rejected",
             "🔵 Implemented", "📋 All Suggestions", "✏️ Edit Suggestions", "📥 Import Excel",
              "👥 Manage Staff Accounts", "⚙️ Manage Approvers"
         ], label_visibility="collapsed")
  
     if page == "📊 Dashboard":
         page_dashboard()
+    elif page == "💡 New Suggestion":
+        page_log_suggestion()
     elif page == "📝 Pending Approvals":
         page_approvals()
     elif page == "📋 All Suggestions":
@@ -2182,11 +2294,11 @@ def page_status_history(status: str):
     if view.empty:
         st.info(f"No {status.lower()} suggestions yet.")
         return
-    show = view[["id","date_submitted","submitted_by","entered_by","employee_type","department","title","category","technique_used","approver","approval_date","date_implemented","tangible_value","reward","reward_value"]].rename(columns={
+    show = view[["id","date_submitted","submitted_by","entered_by","employee_type","department","title","category","technique_used","approver","approval_date","date_implemented","developed_by","tangible_value","reward","reward_value"]].rename(columns={
         "id":"ID", "date_submitted":"Submitted Date", "submitted_by":"Submitted By", "entered_by":"Entered By",
         "employee_type":"Employee Type", "department":"Department", "title":"Suggestion",
         "category":"Category", "technique_used":"Technique", "approver":"Decided By",
-        "approval_date":"Decision Date", "date_implemented":"Date Implemented",
+        "approval_date":"Decision Date", "date_implemented":"Date Implemented", "developed_by":"Developed By",
         "tangible_value":"Tangible Value (LKR)", "reward":"Reward / Recognition",
         "reward_value":"Reward Value (LKR)"
     }).sort_values("Decision Date", ascending=False)
