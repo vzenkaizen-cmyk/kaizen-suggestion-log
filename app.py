@@ -1267,7 +1267,8 @@ def page_log_suggestion():
         with c1:
             entered_display = st.text_input("Entered by", value=entered_by, disabled=True)
         with c2:
-            site_options = list(dict.fromkeys(DEPARTMENTS + [a["department"] for a in accounts if a["department"]]))
+            database_sites = [str(x).strip() for x in df_suggestions()["department"].dropna().tolist() if str(x).strip()]
+            site_options = list(dict.fromkeys(DEPARTMENTS + database_sites + [a["department"] for a in accounts if a["department"]]))
             selected_site = st.selectbox("HOF / Plant Site *", site_options, key="admin_entry_site")
         st.caption("The person entering the record may be different from the person who actually suggested the idea.")
     else:
@@ -1605,17 +1606,49 @@ def page_dashboard():
     else:
         st.info("No implemented suggestions are available for the selected plant/site.")
 
+    # When a participant is selected, the charts use both filters together:
+    # the selected plant/site and the selected participant.
+    chart_source = participant_view if "participant_view" in locals() and selected_participant != "Select a participant" else site_df
+
     left, right = st.columns(2)
     with left:
-        st.markdown("**Suggestion status**")
-        status_df = site_df["status"].value_counts().reindex(STATUSES, fill_value=0).reset_index()
+        if "participant_view" in locals() and selected_participant != "Select a participant":
+            st.markdown(f"**{selected_participant} — Suggestion status**")
+        else:
+            st.markdown("**Suggestion status**")
+        status_df = chart_source["status"].value_counts().reindex(STATUSES, fill_value=0).reset_index()
         status_df.columns = ["Status", "Count"]
         fig = px.bar(status_df, x="Count", y="Status", orientation="h", text="Count")
         fig.update_layout(showlegend=False, height=320, margin=dict(l=10,r=10,t=10,b=10), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
         st.plotly_chart(fig, use_container_width=True)
 
     with right:
-        if selected_site == "All Plants / Sites" and summary_rows:
+        if "participant_view" in locals() and selected_participant != "Select a participant":
+            # Participant filter active: show the same plant-wise status comparison
+            # pattern, but only for the selected participant's suggestions.
+            st.markdown(f"**{selected_participant} — Plant-wise status comparison**")
+            participant_summary = []
+            for plant in department_options:
+                pdf = participant_view[
+                    participant_view["department"].fillna("Not specified").astype(str).str.strip() == plant
+                ]
+                if pdf.empty:
+                    continue
+                participant_summary.append({
+                    "Plant / Site": plant,
+                    "Pending": int((pdf["status"] == "Pending").sum()),
+                    "Approved": int((pdf["status"] == "Approved").sum()),
+                    "Implemented": int((pdf["status"] == "Implemented").sum()),
+                    "Rejected": int((pdf["status"] == "Rejected").sum()),
+                })
+            if participant_summary:
+                participant_chart_df = pd.DataFrame(participant_summary).set_index("Plant / Site")[["Pending", "Approved", "Implemented", "Rejected"]]
+                fig2 = px.bar(participant_chart_df, barmode="group", text_auto=True)
+                fig2.update_layout(height=320, margin=dict(l=10,r=10,t=10,b=10), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", legend_title_text="Status")
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.info("No plant/site data is available for this participant.")
+        elif selected_site == "All Plants / Sites" and summary_rows:
             st.markdown("**Plant-wise status comparison**")
             chart_df = pd.DataFrame(summary_rows).set_index("Plant / Site")[["Pending", "Approved", "Implemented", "Rejected"]]
             fig2 = px.bar(chart_df, barmode="group", text_auto=True)
@@ -1623,7 +1656,7 @@ def page_dashboard():
             st.plotly_chart(fig2, use_container_width=True)
         else:
             st.markdown(f"**{selected_site} — Employee Type**")
-            type_df = site_df["employee_type"].fillna("Unknown").value_counts().reset_index()
+            type_df = chart_source["employee_type"].fillna("Unknown").value_counts().reset_index()
             type_df.columns = ["Employee Type", "Count"]
             fig2 = px.bar(type_df, x="Count", y="Employee Type", orientation="h", text="Count")
             fig2.update_layout(showlegend=False, height=320, margin=dict(l=10,r=10,t=10,b=10), plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
@@ -1667,9 +1700,10 @@ def page_approvals():
                 developed_by = st.text_input(
                     "Developed by",
                     placeholder="Enter the person who developed/implemented the idea",
-                    help="The developer can be different from the person who suggested the idea.",
+                    help="Enter the person who actually developed/implemented the idea. This can be different from the person who suggested it.",
                     key=f"developed_by_{r['id']}",
-                ) if mark_implemented else ""
+                )
+                st.caption("Required when **Mark as already implemented** is selected.")
                 tangible_value = st.number_input("Tangible value (LKR)", min_value=0.0, step=1000.0,
                                                   key=f"val_{r['id']}")
                 reward = st.text_input("Reward / recognition (optional)", key=f"reward_{r['id']}")
