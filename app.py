@@ -832,6 +832,19 @@ def update_suggestion_decision(sug_id, status, approver, tangible_value, reward,
                 "id": sug_id,
             },
         )
+
+
+def update_developed_by(sug_id, developed_by):
+    """Add or update the person who developed/implemented an approved suggestion."""
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE suggestions SET developed_by=:developed_by WHERE id=:id"),
+            {
+                "developed_by": developed_by.strip() or None,
+                "id": sug_id,
+            },
+        )
  
  
 # --------------------------------------------------------------------------- #
@@ -1277,23 +1290,31 @@ def page_log_suggestion():
         st.caption("The person entering the record may be different from the person who actually suggested the idea.")
         selected_site = staff_department
 
-    default_username = entered_by_username if (not is_admin and entered_by_username in account_by_username) else usernames[0]
-    default_index = usernames.index(default_username)
+    default_username = entered_by_username if (not is_admin and entered_by_username in account_by_username) else ""
 
-    with st.form("log_suggestion_form", clear_on_submit=True):
-        selected_username = st.selectbox(
-            "Employee Username *",
-            usernames,
-            index=default_index,
-            format_func=lambda u: f"{account_by_username[u]['display_name']} — {u}",
-            help="Type/search the unique username. The registered full name (First Name + Last Name) is shown automatically.",
-        )
-        selected_suggester = account_by_username[selected_username]
+    # Enter the unique username directly instead of selecting from a dropdown.
+    # The registered full name is resolved automatically from the username.
+    selected_username_input = st.text_input(
+        "Employee Username *",
+        value=default_username,
+        placeholder="Type the registered username, e.g. chamodhi01",
+        help="Enter the unique username created by the Admin. The registered full name will appear automatically.",
+        key="suggestion_employee_username",
+    ).strip().lower()
+
+    selected_suggester = account_by_username.get(selected_username_input)
+
+    if selected_suggester:
         st.success(
             f"👤 Suggested by: **{selected_suggester['display_name']}**  ·  "
             f"Username: **{selected_suggester['username']}**"
         )
+    elif selected_username_input:
+        st.warning("No active Staff/GEMBA account was found for this username. Please check the username and try again.")
+    else:
+        st.info("Type the employee username to load the registered full name.")
 
+    with st.form("log_suggestion_form", clear_on_submit=True):
         if is_admin:
             # The site selected by Admin is outside the form so it can be changed freely.
             pass
@@ -1309,6 +1330,12 @@ def page_log_suggestion():
         submitted = st.form_submit_button("🚀 Submit Suggestion", type="primary", use_container_width=True)
 
     if submitted:
+        if not selected_username_input:
+            st.error("Please enter the employee username.")
+            return
+        if not selected_suggester:
+            st.error("The entered username does not match an active registered Staff/GEMBA account.")
+            return
         if not title.strip():
             st.error("Please enter a suggestion title."); return
         if not description.strip():
@@ -2328,6 +2355,7 @@ def page_status_history(status: str):
     if view.empty:
         st.info(f"No {status.lower()} suggestions yet.")
         return
+
     show = view[["id","date_submitted","submitted_by","entered_by","employee_type","department","title","category","technique_used","approver","approval_date","date_implemented","developed_by","tangible_value","reward","reward_value"]].rename(columns={
         "id":"ID", "date_submitted":"Submitted Date", "submitted_by":"Submitted By", "entered_by":"Entered By",
         "employee_type":"Employee Type", "department":"Department", "title":"Suggestion",
@@ -2338,8 +2366,68 @@ def page_status_history(status: str):
     }).sort_values("Decision Date", ascending=False)
     show["Tangible Value (LKR)"] = pd.to_numeric(show["Tangible Value (LKR)"], errors="coerce").fillna(0)
     show["Reward Value (LKR)"] = pd.to_numeric(show["Reward Value (LKR)"], errors="coerce").fillna(0)
-    st.dataframe(show, use_container_width=True, hide_index=True, column_config=kaizen_table_column_config())
-    st.download_button(f"⬇️ Export {status} suggestions", show.to_csv(index=False).encode("utf-8"), f"kaizen_{status.lower()}_suggestions.csv", "text/csv")
+
+    st.dataframe(
+        show,
+        use_container_width=True,
+        hide_index=True,
+        column_config=kaizen_table_column_config(),
+    )
+
+    # Approved suggestions can still be updated with the person who developed/
+    # implemented the idea. This does not change the approval status or decision.
+    if status == "Approved":
+        st.divider()
+        st.markdown("### 🛠️ Add / Update Developed By")
+        st.caption(
+            "Enter the person who actually developed or implemented the approved idea. "
+            "This can be different from the person who suggested it."
+        )
+
+        for _, r in view.iterrows():
+            current_developed_by = str(r.get("developed_by") or "").strip()
+            with st.expander(
+                f"#{r['id']} — {r['title'] or 'Untitled'} · "
+                f"{r['submitted_by'] or 'Not specified'}"
+            ):
+                st.caption(
+                    f"Plant/Site: {r.get('department') or '—'} · "
+                    f"Approved by: {r.get('approver') or '—'}"
+                )
+
+                with st.form(f"approved_developed_by_form_{r['id']}"):
+                    developed_by_value = st.text_input(
+                        "Developed by",
+                        value=current_developed_by,
+                        placeholder="Enter the person who developed/implemented the idea",
+                        help="You can enter or update the developer's full name.",
+                    )
+                    save_developed_by = st.form_submit_button(
+                        "💾 Save Developed By",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+                if save_developed_by:
+                    if not developed_by_value.strip():
+                        st.error("Please enter the developer's name.")
+                    else:
+                        try:
+                            update_developed_by(r["id"], developed_by_value)
+                            st.success(
+                                f"Developed By for suggestion #{r['id']} updated to "
+                                f"**{developed_by_value.strip()}**."
+                            )
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Could not update Developed By: {e}")
+
+    st.download_button(
+        f"⬇️ Export {status} suggestions",
+        show.to_csv(index=False).encode("utf-8"),
+        f"kaizen_{status.lower()}_suggestions.csv",
+        "text/csv",
+    )
  
  
 # --------------------------------------------------------------------------- #
